@@ -227,7 +227,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 
 | # | 问题 | 当前打算 |
 | --- | --- | --- |
-| O1 | jp 注册与登录的完整请求细节（设备字段、请求头取值） | 对照 jp 7.1.0 安装包和 sssekai 确认；先在本机跑 `register` + `once` |
+| O1 | ~~jp 注册与登录的完整请求细节~~ | **已解决（N3，2026-11-11）**：按公开实现（sssekai 等）的请求格式，本机注册、登录、分片下载跑通，JP2 上线运行正常；见 §5.1、§15 |
 | O2 | ~~`compact*` 表展开规则、Haruki 多出的文件~~ | **已解决（N1）**：多出的 8 个文件就是 compact 表展开的结果，规则见 §5.3 |
 | O3 | ~~数据仓库与 App 安装范围~~ | **已定（2026-11-11）**：五个公开仓库 `StarMoe-org/moesekai-masterdata-{jp,cn,en,hmt,kr}` 已建（区服代码与 moesekai-app-meta 一致，繁中服用 `hmt`），`moesekai-bot` 已加装到这五个仓库；en / hmt / kr 暂时空着 |
 | O4 | ~~拉 master 的间隔~~ | **已定（2026-11-11）**：jp、cn 默认都是 **5 分钟**（`MOESEKAI_POLL_JP` / `MOESEKAI_POLL_CN` 可调），±10% 抖动；网络错误、5xx 指数退避（1 分钟起，最长 30 分钟）；503 维护固定 5 分钟后再试；426 / `not_available` 暂停该区服，转 §6 刷新 app-meta、请求 builder；jp 的 cookie 跨轮复用，403 时才重新获取 |
