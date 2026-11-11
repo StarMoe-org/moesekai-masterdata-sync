@@ -97,6 +97,9 @@ func New(cfg Config, b *appmeta.Bundle) *Client {
 	return &Client{Config: cfg, Bundle: b, HTTP: &http.Client{Timeout: 2 * time.Minute}}
 }
 
+// Prepared 表示已经拿到 API 域名和 cookie（之后的轮次可以跳过 Prepare）。
+func (c *Client) Prepared() bool { return c.apiBase != "" && c.cookie != "" }
+
 // Profile 是 game-version 返回的环境名（production）。
 func (c *Client) Profile() string { return c.profile }
 

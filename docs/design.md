@@ -27,7 +27,7 @@
 | --- | --- | --- |
 | S1 | 语言 | Go |
 | S2 | 代码仓库 | `StarMoe-org/moesekai-masterdata-sync`，**公开**（2026-11-11 由私有改定：已有不少公开项目包含 jp 注册流程，私有带来的保护有限）。代码里不放任何密钥、账号或 uid，全部来自 Secret 或 app-meta |
-| S3 | 构建与更新 | **待重新确认**（S2 改为公开后，可能改走和 builder 相同的 GitHub Actions → GHCR → Ferry 流程）。原定：按 StarMoe 私有仓库流程：在 Ferry 注册代码源，CNB 构建，镜像 `docker.cnb.cool/starmoe-org/ci/<镜像名>:<sha12>`（集群已预置拉取凭据）；Ferry 自动滚动更新；首次创建用 ssh + `kubectl create` |
+| S3 | 构建与更新 | **已定（2026-11-11 改）**：和 pjsk-meta-builder 一样用 StarMoe 标准 `deploy.yml`：push 到 main → GitHub Actions 构建 `ghcr.io/starmoe-org/moesekai-masterdata-sync:<sha12>` → 用 `CNB_TOKEN` 改 infra → Ferry 滚动更新；首次创建用 ssh + `kubectl create` |
 | S4 | 发布方式 | **本服务自己用 git 推送**到 `moesekai-masterdata-<region>`（不检出工作目录的部分克隆放在 emptyDir，提交、推送；§7.1）。服务不对公网开放 |
 | S5 | GitHub 凭据 | 复用 GitHub App `moesekai-bot`，安装范围扩到各数据仓库；换 token 时只申请当前那一个仓库 |
 | S6 | jp 账号 | 服务**自动注册**，写回 K8s Secret；服务有自己的 ServiceAccount + Role，只能读写这一个账号 Secret（和变量 Secret 分开） |
@@ -57,22 +57,24 @@
    pjsk-meta-builder（JP2 内网）
 ```
 
-### 3.1 包划分（暂定）
+### 3.1 包划分
 
 | 包 | 职责 |
 | --- | --- |
-| `cmd/moesekai-sync` | 入口：`serve`、`once`（跑一轮就退出）、`register`、`decode`、`version` |
-| `internal/config` | 环境变量（+ 可选 YAML）加载、校验 |
+| `cmd/moesekai-sync` | 入口：`serve`、`once`（跑一轮就退出）、`decode`、`version` |
 | `internal/appmeta` | 读 `moesekai-app-meta`：latest.json、meta.json、moe-info.json（0/1 位串解码）、schema.json；校验 sha256 |
-| `internal/crypto` | AES-128-CBC + PKCS7；MessagePack 流式解码 |
-| `internal/cp` | CP 服客户端（jp）：game-version、签名 cookie、注册、登录、分片下载 |
-| `internal/nuverse` | Nuverse 客户端（cn）：免 token login、CDN 下载、按结构文件还原、compact 表展开 |
-| `internal/master` | 写出规范 JSON、删除保护 |
-| `internal/publish` | git 发布（调用 `git` 命令）；GitHub App token |
-| `internal/account` | AccountStore：K8s Secret 实现（测试用文件实现） |
-| `internal/builder` | 调 builder 的 `POST /v1/builds`；接收回调；HMAC |
-| `internal/worker` | 每个区服的主循环 |
-| `internal/httpapi` | 健康检查、指标、回调入口 |
+| `internal/crypto`、`internal/msgpack`、`internal/jsonout` | AES-128-CBC；MessagePack 解码与编码；Python 兼容的 JSON 输出 |
+| `internal/sega` | CP 服客户端（jp）：game-version、CloudFront cookie、注册、登录、分片下载；账号存储接口和文件实现 |
+| `internal/nuverse` | Nuverse 客户端（cn）：免 token login、CDN 下载 |
+| `internal/schema` | 按结构文件还原 Nuverse master、compact 表展开 |
+| `internal/master` | 写出表和版本文件、删除保护、版本号比较 |
+| `internal/gitrepo`、`internal/publish` | 不检出工作目录的 git 发布（§7.1）；本地目录 / git 两种写入目标 |
+| `internal/ghapp` | GitHub App installation token |
+| `internal/syncer` | 一轮同步（once 和 serve 共用），错误分成过期 / 维护 / 对不上结构文件 |
+| `internal/worker` | 每个区服的主循环：调度、抖动、退避、等 builder（§6、O4） |
+| `internal/builder`、`internal/hmacauth` | 调 builder 的 `POST /v1/builds`、回调格式；双向 HMAC |
+| `internal/kube` | 账号存储的 K8s Secret 实现（只用 get / patch 两个请求，不引入 client-go） |
+| `internal/httpapi` | `/healthz`、`/readyz`、`/metrics`、`POST /v1/app-meta/callback` |
 
 ## 4. 输入：moesekai-app-meta
 
@@ -218,7 +220,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - Deployment：单副本、`Recreate`；emptyDir 申请 2Gi 临时存储；非 root、只读根文件系统；内存 request / limit 必填（StarMoe 约定）。
 - ServiceAccount + Role：只允许 `get` / `update` / `patch` 账号 Secret 这一个对象（`resourceNames`）。
 - Service：ClusterIP，只给 builder 回调用，不建 Ingress。
-- 镜像：Alpine + `git` + `ca-certificates`，CNB 构建（S3）。
+- 镜像：Alpine + `git` + `ca-certificates`，`ghcr.io/starmoe-org/moesekai-masterdata-sync`（S3）。完整的变量表和首次创建步骤见 `deploy/README.md`。
 
 ## 10. 未决项
 
@@ -227,7 +229,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 | O1 | jp 注册与登录的完整请求细节（设备字段、请求头取值） | 对照 jp 7.1.0 安装包和 sssekai 确认；先在本机跑 `register` + `once` |
 | O2 | ~~`compact*` 表展开规则、Haruki 多出的文件~~ | **已解决（N1）**：多出的 8 个文件就是 compact 表展开的结果，规则见 §5.3 |
 | O3 | ~~数据仓库与 App 安装范围~~ | **已定（2026-11-11）**：五个公开仓库 `StarMoe-org/moesekai-masterdata-{jp,cn,en,hmt,kr}` 已建（区服代码与 moesekai-app-meta 一致，繁中服用 `hmt`），`moesekai-bot` 已加装到这五个仓库；en / hmt / kr 暂时空着 |
-| O4 | 拉 master 的间隔 | 建议 jp 2 分钟、cn 1 分钟，±10% 抖动，出错指数退避最长 30 分钟；待确认 |
+| O4 | ~~拉 master 的间隔~~ | **已定（2026-11-11）**：jp、cn 默认都是 **5 分钟**（`MOESEKAI_POLL_JP` / `MOESEKAI_POLL_CN` 可调），±10% 抖动；网络错误、5xx 指数退避（1 分钟起，最长 30 分钟）；503 维护固定 5 分钟后再试；426 / `not_available` 暂停该区服，转 §6 刷新 app-meta、请求 builder；jp 的 cookie 跨轮复用，403 时才重新获取 |
 | O5 | ~~首次导入~~ | **已定（2026-11-11）**：数据仓库从空仓库开始，第一次运行提交当前完整的 master 和版本文件，不导入 Haruki 的历史 |
 | O6 | ~~cn login 用哪个账号的 uid~~ | **已定（2026-11-11）**：用户自己的国服账号 uid（只用 id，不用 token），放在服务的 Secret `MOESEKAI_CN_UID`；值不进仓库、不写日志。被风控时影响的是这个账号，需要换号时只改这个值。官方修复免 token login 后改用固定的已登录账号（§5.2），凭据同样只放 Secret |
 | O7 | `billingShopItemRandomBoxGroups` | Haruki 的生成器没映射这个类（类名不带 Master 前缀），原样输出数组；我们按类还原成了对象。是否改成和 Haruki 一样待定 |
@@ -275,4 +277,12 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - 与 Haruki jp 仓库（同为 7.1.0.60）对照：**417 张表全部逐字节相同**；Haruki 多 2 个派生文件（O10，决定不生成）；版本文件只差 `multiPlayVersion`（O11），其余字段和格式一致。
 - 推到 GitHub `StarMoe-org/moesekai-masterdata-jp`：第一次提交约 42 秒；再跑一次判为没有新 master；克隆回来与本地输出逐字节一致，工作目录 `config` 里没有凭据。
 - 模拟服务器测试覆盖：注册并保存、读已保存的账号、403 后重新拿 cookie 重试、426 / 503 / 500、分片下载、服务器换发 session token、错误信息不含 userId。
+
+## 16. N4 进度（2026-11-11）
+
+- 代码：`serve` 命令和 §3.1 里新增的 `syncer`、`worker`、`builder`、`hmacauth`、`kube`、`httpapi`；`gitrepo` 增加 `ReadFile` 缓存（按 blob 对象名）和超过 512MB 清空本地副本。两个区服共用一把锁，同一时间只有一个区服在跑一轮。jp 的 cookie 跨轮复用。
+- 部署文件：`Dockerfile`（golang:1.27-alpine 交叉编译 → alpine:3.22 + git 2.49，非 root）、`deploy/k8s.yaml`（ServiceAccount、空的账号 Secret、只能 get / patch 这一个 Secret 的 Role、Deployment、Service）、`deploy/README.md`；`deploy.yml` 与 StarMoe 模板逐字节相同，仓库能读到组织级的 `CNB_TOKEN`。
+- 本机演练：`serve` 推到两个本地空裸仓库（间隔 30 秒、不接 builder），首轮 jp、cn 依次全量写出并提交，之后每轮都判为没有新 master；jp 第二轮起只发登录请求；签名回调 204、错误签名 401；`/healthz`、`/metrics` 输出正确；SIGTERM 后 3 秒内退出，全程无错误日志。
+- 单元测试：worker（正常间隔、退避翻倍到 30 分钟、维护、过期后请求 builder 并等待、可重试 / 不可重试的回调、app-meta 已有新版本时直接换上）、httpapi、hmacauth（与 Python 独立算出的向量对照）、kube（模拟 API server）。
+- 未做：镜像构建（本机没有 docker，第一次由 GitHub Actions 构建）、JP2 首次部署。
 

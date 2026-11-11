@@ -13,27 +13,31 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/ghapp"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/gitrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/master"
-	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/msgpack"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/nuverse"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/publish"
-	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/schema"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/sega"
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/syncer"
 )
 
+// version 由构建时的 -ldflags "-X main.version=…" 设置。
+var version = "dev"
+
 const usage = `用法：
-  moesekai-sync decode --region cn --info <master-data-N.info> --out <目录> [--app-meta <地址>]
-      离线：用 app-meta 里当前版本的密钥和结构文件解密、还原一份本地 master，写到 <目录>
+  moesekai-sync serve
+      常驻服务：按间隔同步各区服并推送到数据仓库；HTTP 提供 /healthz /metrics 和 builder 回调（配置见 README）
   moesekai-sync once --region cn|jp (--out <目录> | --repo <仓库地址> [--work <目录>]) [--app-meta <地址>] [--force] [--register]
       跑一轮：查当前版本，有新 master 就下载、还原、写出。--repo 时提交并推送（不检出工作目录）
       jp 没有账号时，加 --register 才会注册一个新账号（先保存到账号文件再使用）
+  moesekai-sync decode --region cn --info <master-data-N.info> --out <目录> [--app-meta <地址>]
+      离线：用 app-meta 里当前版本的密钥和结构文件解密、还原一份本地 master，写到 <目录>
+  moesekai-sync version
 
-环境变量：
+环境变量（once）：
   MOESEKAI_CN_UID（或 _FILE）              cn login 用的已存在账号 id
   MOESEKAI_JP_ACCOUNT_FILE                 jp 账号文件（JSON，0600；没有时配合 --register 注册）
   GITHUB_APP_ID、GITHUB_APP_PRIVATE_KEY（或 _FILE）   推送到 GitHub 时用
@@ -53,10 +57,14 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
-	case "decode":
-		err = cmdDecode(ctx, os.Args[2:])
+	case "serve":
+		err = cmdServe(ctx)
 	case "once":
 		err = cmdOnce(ctx, os.Args[2:])
+	case "decode":
+		err = cmdDecode(ctx, os.Args[2:])
+	case "version":
+		fmt.Println(version)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(64)
@@ -98,6 +106,59 @@ func appMetaClient(base string) *appmeta.Client {
 	return c
 }
 
+// cnConfig 读 MOESEKAI_CN_UID。
+func cnConfig() (nuverse.Config, error) {
+	cfg := nuverse.CN
+	uidText, err := secret("MOESEKAI_CN_UID")
+	if err != nil {
+		return cfg, err
+	}
+	if uidText != "" {
+		if cfg.UserID, err = strconv.ParseUint(uidText, 10, 64); err != nil {
+			return cfg, usageError{"MOESEKAI_CN_UID 不是数字"}
+		}
+	}
+	return cfg, nil
+}
+
+// githubApp 读 GitHub App 配置；没配置时返回 nil。
+func githubApp() (*ghapp.App, error) {
+	id := os.Getenv("GITHUB_APP_ID")
+	key, err := secret("GITHUB_APP_PRIVATE_KEY")
+	if err != nil {
+		return nil, err
+	}
+	if id == "" && key == "" {
+		return nil, nil
+	}
+	if id == "" || key == "" {
+		return nil, usageError{"GITHUB_APP_ID 和 GITHUB_APP_PRIVATE_KEY 要一起配置"}
+	}
+	return ghapp.New(id, key)
+}
+
+// newRepo 创建数据仓库的本地副本；GitHub 地址用 App 换只针对该仓库的 token。
+func newRepo(repoURL, work string, app *ghapp.App) (*gitrepo.Repo, error) {
+	r := &gitrepo.Repo{Dir: work, URL: repoURL, Author: botIdentity}
+	if owner, name, ok := githubRepo(repoURL); ok {
+		if app == nil {
+			return nil, usageError{"推送到 GitHub 需要 GITHUB_APP_ID 和 GITHUB_APP_PRIVATE_KEY"}
+		}
+		r.Token = func(ctx context.Context) (string, error) { return app.Token(ctx, owner, name) }
+	}
+	return r, nil
+}
+
+// githubRepo 从 https://github.com/<owner>/<repo>(.git) 取出 owner、repo。
+func githubRepo(url string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(url, "https://github.com/")
+	if !ok {
+		return "", "", false
+	}
+	owner, name, ok := strings.Cut(strings.TrimSuffix(strings.TrimSuffix(rest, "/"), ".git"), "/")
+	return owner, name, ok && owner != "" && name != "" && !strings.Contains(name, "/")
+}
+
 func cmdDecode(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("decode", flag.ContinueOnError)
 	region := fs.String("region", "", "区服")
@@ -118,7 +179,7 @@ func cmdDecode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	tables, err := decodeNuverse(b, raw)
+	tables, err := syncer.DecodeNuverse(b, raw)
 	if err != nil {
 		return err
 	}
@@ -126,83 +187,8 @@ func cmdDecode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	logTables(tables, res)
+	syncer.LogTables(*region, tables, res)
 	return nil
-}
-
-// decodeNuverse 解密 + 解码 + 按结构文件还原。
-func decodeNuverse(b *appmeta.Bundle, raw []byte) (*schema.Result, error) {
-	if b.Schema == nil {
-		return nil, fmt.Errorf("%s 当前版本没有 schema.json", b.Meta.Region)
-	}
-	s, err := schema.Parse(b.Schema)
-	if err != nil {
-		return nil, err
-	}
-	t0 := time.Now()
-	plain, err := b.Keys.API().Decrypt(raw)
-	if err != nil {
-		return nil, fmt.Errorf("解密 master：%w", err)
-	}
-	v, err := msgpack.Decode(plain)
-	if err != nil {
-		return nil, fmt.Errorf("解码 master：%w", err)
-	}
-	plain = nil
-	t1 := time.Now()
-	res, err := s.Restore(v)
-	if err != nil {
-		return nil, fmt.Errorf("还原 master：%w", err)
-	}
-	slog.Info("解码完成", "bytes", len(raw), "decode", t1.Sub(t0).Round(time.Millisecond), "restore", time.Since(t1).Round(time.Millisecond))
-	return res, nil
-}
-
-func logTables(tables *schema.Result, res *master.WriteResult) {
-	slog.Info("表已生成", "tables", len(res.Produced), "changed", len(res.Written), "unchanged", res.Unchanged,
-		"unknown", tables.Unknown, "dropped", tables.Dropped, "expanded", len(tables.Expanded))
-}
-
-// openTarget 根据 --out / --repo 打开写入目标。
-func openTarget(ctx context.Context, out, repoURL, work string) (publish.Target, error) {
-	switch {
-	case out != "" && repoURL != "":
-		return nil, usageError{"--out 和 --repo 只能用一个"}
-	case out != "":
-		return &publish.Dir{Root: out}, nil
-	case repoURL == "":
-		return nil, usageError{"需要 --out 或 --repo"}
-	}
-	if work == "" {
-		work = filepath.Join(os.TempDir(), "moesekai-sync", strings.NewReplacer("/", "_", ":", "_").Replace(repoURL))
-	}
-	r := &gitrepo.Repo{Dir: work, URL: repoURL, Author: botIdentity}
-	if owner, name, ok := githubRepo(repoURL); ok {
-		id := os.Getenv("GITHUB_APP_ID")
-		key, err := secret("GITHUB_APP_PRIVATE_KEY")
-		if err != nil {
-			return nil, err
-		}
-		if id == "" || key == "" {
-			return nil, usageError{"推送到 GitHub 需要 GITHUB_APP_ID 和 GITHUB_APP_PRIVATE_KEY"}
-		}
-		app, err := ghapp.New(id, key)
-		if err != nil {
-			return nil, err
-		}
-		r.Token = func(ctx context.Context) (string, error) { return app.Token(ctx, owner, name) }
-	}
-	return publish.OpenGit(ctx, r)
-}
-
-// githubRepo 从 https://github.com/<owner>/<repo>(.git) 取出 owner、repo。
-func githubRepo(url string) (string, string, bool) {
-	rest, ok := strings.CutPrefix(url, "https://github.com/")
-	if !ok {
-		return "", "", false
-	}
-	owner, name, ok := strings.Cut(strings.TrimSuffix(strings.TrimSuffix(rest, "/"), ".git"), "/")
-	return owner, name, ok && owner != "" && name != "" && !strings.Contains(name, "/")
 }
 
 func cmdOnce(ctx context.Context, args []string) error {
@@ -217,201 +203,71 @@ func cmdOnce(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	switch *region {
-	case "cn":
-	case "jp":
-		return onceSega(ctx, *out, *repoURL, *work, *base, *force, *register)
-	default:
+	if *region != "cn" && *region != "jp" {
 		return usageError{"once 目前只支持 --region cn 或 jp"}
 	}
-	cfg := nuverse.CN
-	uidText, err := secret("MOESEKAI_CN_UID")
-	if err != nil {
-		return err
+
+	var target publish.Target
+	switch {
+	case *out != "" && *repoURL != "":
+		return usageError{"--out 和 --repo 只能用一个"}
+	case *out != "":
+		target = &publish.Dir{Root: *out}
+	case *repoURL == "":
+		return usageError{"需要 --out 或 --repo"}
 	}
-	if uidText != "" {
-		if cfg.UserID, err = strconv.ParseUint(uidText, 10, 64); err != nil {
-			return usageError{"MOESEKAI_CN_UID 不是数字"}
+
+	// 先检查各区服自己的配置，再访问网络
+	var cnCfg nuverse.Config
+	var store sega.AccountStore
+	switch *region {
+	case "cn":
+		var err error
+		if cnCfg, err = cnConfig(); err != nil {
+			return err
 		}
+	case "jp":
+		f := os.Getenv("MOESEKAI_JP_ACCOUNT_FILE")
+		if f == "" {
+			return usageError{"jp 需要 MOESEKAI_JP_ACCOUNT_FILE"}
+		}
+		store = sega.FileStore(f)
 	}
+
 	b, err := appMetaClient(*base).Latest(ctx, *region)
 	if err != nil {
 		return err
 	}
-	target, err := openTarget(ctx, *out, *repoURL, *work)
-	if err != nil {
-		return err
-	}
-	commit, err := syncNuverse(ctx, nuverse.New(cfg), b, target, nil, *force)
-	if err != nil {
-		return err
-	}
-	if commit != "" {
-		slog.Info("已推送", "commit", commit)
-	}
-	return nil
-}
-
-// syncNuverse 跑一轮 Nuverse 服：login → 比较 cdnVersion → 下载、还原、写出 → 提交。
-// guard 为 nil 时不删除任何表（单次运行没有「连续两次缺失」的依据）。
-func syncNuverse(ctx context.Context, c *nuverse.Client, b *appmeta.Bundle, t publish.Target, guard *master.DeleteGuard, force bool) (string, error) {
-	region := b.Meta.Region
-	st, err := c.Login(ctx, b)
-	if err != nil {
-		return "", err
-	}
-	slog.Info("login", "region", region, "version", b.Meta.NuverseAppVersion(), "http", st.HTTPStatus,
-		"status", st.AppVersionStatus, "dataVersion", st.DataVersion, "cdnVersion", st.CDNVersion)
-	if st.Outdated() {
-		// N4：这里改成刷新 app-meta、必要时请求 builder（设计文档 §6）
-		return "", fmt.Errorf("app-meta 里的 %s %s 已被服务器淘汰（HTTP %d，%s），需要新版本的元数据",
-			region, b.Meta.NuverseAppVersion(), st.HTTPStatus, st.AppVersionStatus)
-	}
-	cur, err := t.Current(ctx)
-	if err != nil {
-		return "", err
-	}
-	if cur != nil && cur.CDNVersion >= st.CDNVersion && !force {
-		slog.Info("没有新的 master", "region", region, "current", cur.CDNVersion)
-		return "", nil
-	}
-	raw, url, err := c.DownloadMaster(ctx, st.CDNVersion)
-	if err != nil {
-		return "", err
-	}
-	slog.Info("已下载", "url", url, "bytes", len(raw))
-	tables, err := decodeNuverse(b, raw)
-	if err != nil {
-		return "", err
-	}
-	raw = nil
-	existing := master.TablesIn(t.Files())
-	res, err := master.WriteTables(t, tables.Tables)
-	if err != nil {
-		return "", err
-	}
-	logTables(tables, res)
-	if guard != nil {
-		for _, name := range guard.Decide(existing, res.Produced) {
-			slog.Warn("删除表", "region", region, "table", name)
-			t.Delete("master/" + name + ".json")
-		}
-	}
-	v := master.Version{
-		SystemProfile:    "production",
-		AppVersion:       st.AppVersion,
-		MultiPlayVersion: st.MultiPlayVersion,
-		DataVersion:      st.DataVersion,
-		AssetVersion:     st.AssetVersion,
-		AppHash:          b.Meta.AppHash,
-		AppVersionStatus: st.AppVersionStatus,
-		CDNVersion:       st.CDNVersion,
-	}
-	if err := master.WriteVersion(t, v); err != nil {
-		return "", err
-	}
-	return t.Finish(ctx, "Sekai master data version "+st.DataVersion)
-}
-
-func onceSega(ctx context.Context, out, repoURL, work, base string, force, register bool) error {
-	accountFile := os.Getenv("MOESEKAI_JP_ACCOUNT_FILE")
-	if accountFile == "" {
-		return usageError{"jp 需要 MOESEKAI_JP_ACCOUNT_FILE"}
-	}
-	b, err := appMetaClient(base).Latest(ctx, "jp")
-	if err != nil {
-		return err
-	}
-	target, err := openTarget(ctx, out, repoURL, work)
-	if err != nil {
-		return err
-	}
-	commit, err := syncSega(ctx, sega.New(sega.JP, b), sega.FileStore(accountFile), register, target, nil, force)
-	if err != nil {
-		return err
-	}
-	if commit != "" {
-		slog.Info("已推送", "commit", commit)
-	}
-	return nil
-}
-
-// syncSega 跑一轮 CP 服：game-version + cookie → 登录 → 比较 dataVersion → 逐个分片写出 → 提交。
-func syncSega(ctx context.Context, c *sega.Client, store sega.AccountStore, register bool, t publish.Target, guard *master.DeleteGuard, force bool) (string, error) {
-	region, m := c.Config.Region, c.Bundle.Meta
-	if err := c.Prepare(ctx); err != nil {
-		return "", err
-	}
-	acct, created, err := sega.EnsureAccount(ctx, c, store, register)
-	if err != nil {
-		return "", err
-	}
-	if created {
-		slog.Warn("已注册新账号并保存", "region", region)
-	}
-	s, err := c.Login(ctx, acct)
-	if errors.Is(err, sega.ErrOutdated) {
-		// N4：这里改成刷新 app-meta、必要时请求 builder（设计文档 §6）
-		return "", fmt.Errorf("app-meta 里的 %s %s 已被服务器淘汰，需要新版本的元数据：%w", region, m.AppVersion, err)
-	}
-	if err != nil {
-		return "", err
-	}
-	slog.Info("login", "region", region, "version", m.AppVersion, "status", s.AppVersionStatus,
-		"dataVersion", s.DataVersion, "assetVersion", s.AssetVersion, "splits", len(s.SplitPaths))
-	cur, err := t.Current(ctx)
-	if err != nil {
-		return "", err
-	}
-	if cur != nil && master.CompareVersions(cur.DataVersion, s.DataVersion) >= 0 && !force {
-		slog.Info("没有新的 master", "region", region, "current", cur.DataVersion)
-		return "", nil
-	}
-	existing := master.TablesIn(t.Files())
-	total := &master.WriteResult{Produced: map[string]bool{}}
-	t0 := time.Now()
-	err = c.Master(ctx, func(split *msgpack.Map) error {
-		for _, k := range split.Keys {
-			if name, _ := k.(string); total.Produced[name] {
-				return fmt.Errorf("表 %s 出现在多个分片里", name)
-			}
-		}
-		res, err := master.WriteTables(t, split)
+	if target == nil {
+		app, err := githubApp()
 		if err != nil {
 			return err
 		}
-		for n := range res.Produced {
-			total.Produced[n] = true
+		dir := *work
+		if dir == "" {
+			dir = filepath.Join(os.TempDir(), "moesekai-sync", strings.NewReplacer("/", "_", ":", "_").Replace(*repoURL))
 		}
-		total.Written = append(total.Written, res.Written...)
-		total.Unchanged += res.Unchanged
-		return nil
-	})
+		r, err := newRepo(*repoURL, dir, app)
+		if err != nil {
+			return err
+		}
+		if target, err = publish.OpenGit(ctx, r); err != nil {
+			return err
+		}
+	}
+
+	opt := syncer.Options{Force: *force} // 单次运行不删除任何表（没有「连续两次缺失」的依据）
+	var res *syncer.Result
+	if *region == "cn" {
+		res, err = syncer.Nuverse(ctx, nuverse.New(cnCfg), b, target, opt)
+	} else {
+		res, err = syncer.Sega(ctx, sega.New(sega.JP, b), store, *register, target, opt)
+	}
 	if err != nil {
-		return "", err
+		return err
 	}
-	slog.Info("表已生成", "region", region, "tables", len(total.Produced), "changed", len(total.Written),
-		"unchanged", total.Unchanged, "took", time.Since(t0).Round(time.Millisecond))
-	if guard != nil {
-		for _, name := range guard.Decide(existing, total.Produced) {
-			slog.Warn("删除表", "region", region, "table", name)
-			t.Delete("master/" + name + ".json")
-		}
+	if res.Commit != "" {
+		slog.Info("已推送", "commit", res.Commit)
 	}
-	v := master.Version{
-		Layout:             master.LayoutSega,
-		AppHash:            m.AppHash,
-		SystemProfile:      c.Profile(),
-		AppVersion:         s.AppVersion,
-		MultiPlayVersion:   s.MultiPlayVersion,
-		AssetVersion:       s.AssetVersion,
-		AppVersionStatus:   s.AppVersionStatus,
-		DataVersion:        s.DataVersion,
-		AssetHash:          s.AssetHash,
-		RemoveAssetVersion: s.RemoveAssetVersion,
-	}
-	if err := master.WriteVersion(t, v); err != nil {
-		return "", err
-	}
-	return t.Finish(ctx, "Sekai master data version "+s.DataVersion)
+	return nil
 }

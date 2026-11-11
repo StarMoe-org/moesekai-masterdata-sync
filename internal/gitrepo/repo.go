@@ -34,8 +34,9 @@ type Repo struct {
 	Token  func(ctx context.Context) (string, error)
 	Author Identity
 
-	head  string           // 远端分支当前的提交；空表示远端还没有这个分支
-	files map[string]Entry // head 的全部文件
+	head  string            // 远端分支当前的提交；空表示远端还没有这个分支
+	files map[string]Entry  // head 的全部文件
+	small map[string][]byte // ReadFile 读过的小文件（按 blob 对象名缓存，内容不会变）
 }
 
 // Head 返回最近一次 Fetch 得到的提交（空仓库为空串）。
@@ -274,6 +275,9 @@ func (r *Repo) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if !ok {
 		return nil, nil
 	}
+	if data, ok := r.small[e.Hash]; ok {
+		return data, nil
+	}
 	var env []string
 	if r.Token != nil {
 		tok, err := r.Token(ctx)
@@ -287,5 +291,40 @@ func (r *Repo) ReadFile(ctx context.Context, path string) ([]byte, error) {
 		}
 	}
 	env = append(env, "GIT_NO_LAZY_FETCH=0") // 覆盖 gitIn 里的默认值（后设置的生效）
-	return r.gitIn(ctx, env, nil, "cat-file", "blob", e.Hash)
+	data, err := r.gitIn(ctx, env, nil, "cat-file", "blob", e.Hash)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= 64<<10 {
+		if r.small == nil {
+			r.small = map[string][]byte{}
+		}
+		r.small[e.Hash] = data
+	}
+	return data, nil
+}
+
+// ResetIfLarger 在本地对象目录超过 limit 字节时整个删掉（下次 Fetch 重新初始化，只需几百 KB 的目录树）。
+// 本服务写过的 blob 都已推到远端，本地不再需要；长期运行时用它限制 emptyDir 的占用。
+func (r *Repo) ResetIfLarger(limit int64) (bool, error) {
+	var size int64
+	err := filepath.WalkDir(filepath.Join(r.Dir, "objects"), func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			if info, err := d.Info(); err == nil {
+				size += info.Size()
+			}
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if size <= limit {
+		return false, nil
+	}
+	r.head, r.files, r.small = "", nil, nil
+	return true, os.RemoveAll(r.Dir)
 }

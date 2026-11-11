@@ -212,3 +212,32 @@ func TestBuildTreeRejects(t *testing.T) {
 		t.Error("BlobHash 和 git hash-object 不一致")
 	}
 }
+
+func TestResetIfLarger(t *testing.T) {
+	ctx := context.Background()
+	url, _ := newRemote(t)
+	a := newRepo(t, url)
+	cs := a.NewChangeset()
+	put(t, cs, "f", strings.Repeat("x", 10000))
+	if _, err := cs.Commit(ctx, "c"); err != nil {
+		t.Fatal(err)
+	}
+	if reset, err := a.ResetIfLarger(1 << 30); reset || err != nil {
+		t.Fatalf("没超过上限不应删除：%v %v", reset, err)
+	}
+	if reset, err := a.ResetIfLarger(10); !reset || err != nil {
+		t.Fatalf("超过上限应删除：%v %v", reset, err)
+	}
+	if err := a.Fetch(ctx); err != nil || len(a.Files()) != 1 {
+		t.Fatalf("删除后重新拉取：%v %v", err, a.Files())
+	}
+	// ReadFile 的缓存：第二次不再访问远端
+	data, err := a.ReadFile(ctx, "f")
+	if err != nil || len(data) != 10000 {
+		t.Fatalf("ReadFile：%d %v", len(data), err)
+	}
+	a.URL = "file:///nonexistent"
+	if _, err := a.ReadFile(ctx, "f"); err != nil {
+		t.Errorf("第二次应读缓存：%v", err)
+	}
+}
