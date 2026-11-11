@@ -106,6 +106,10 @@ GET  https://{domain}/api/{suiteMasterSplitPath[i]}            → 逐个分片�
 
 - 请求头：`X-App-Version`、`X-App-Hash`、`X-Data-Version`、`X-Asset-Version`、`X-Unity-Version`、`X-Platform`、`X-DeviceModel`、`X-OperatingSystem`、`X-Install-Id`、`X-Request-Id`、`X-Session-Token`。
 - 状态码：403 → 重新拿 cookie、重新登录一次；**426 → 版本过期（§6）**；503 → 维护，退避。
+- 2026-11-11 实测（jp 7.1.0，本机）：game-version 返回 `profile=production`、`domain`、`assetbundleHostHash`；`issue/api/signature` 的响应体是 `{}`，Set-Cookie 里有 `CloudFront-Policy` / `-Signature` / `-Key-Pair-Id` 三项，拼成 Cookie 后 API 才不再返回 CloudFront 的 403。
+- **`GET /api/system` 只要 cookie、不用登录**，返回全部 appVersion（当前 100 条）及各自的 `appVersionStatus`、`assetVersion`、`multiPlayVersion`；目前只有 7.1.0 是 `available`。新版本上线时会出现在这里，可作为 jp 的新版本信号（比登录便宜），交给 builder M6 参考。
+- Haruki jp 仓库的输出与 cn 不同：版本文件字段顺序为 appHash, systemProfile, appVersion, multiPlayVersion, assetVersion, appVersionStatus, dataVersion, assetHash, removeAssetVersion, cdnVersion（恒为 0）；表内键保持服务器顺序，不排序；另有 `compactCards` / `compactGachas`，**不是服务器的数据**，是 Haruki-Sekai-API 自己生成的派生文件（`cards` / `gachas` 里的 `cardParameters` / `gachaDetails` 改成按列存放，给 Haruki-Toolbox 减小下载体积），见 O10。实现见 `master.LayoutSega`；对照结果见 §15。
+- 本机用 `MOESEKAI_JP_ACCOUNT_FILE`（JSON，0600）保存账号；`once` 只有加 `--register` 才会注册。
 - **自动注册**：账号 Secret 里没有账号时，`POST /api/user`（`{platform, deviceModel, operatingSystem}`）→ `userId`、`credential`；**先写入 Secret 成功，再使用**。账号失效（登录 401/403 重试后仍失败）时报告警，不自动换号。
 
 ### 5.2 cn（Nuverse 服）——不需要账号
@@ -228,6 +232,8 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 | O6 | ~~cn login 用哪个账号的 uid~~ | **已定（2026-11-11）**：用户自己的国服账号 uid（只用 id，不用 token），放在服务的 Secret `MOESEKAI_CN_UID`；值不进仓库、不写日志。被风控时影响的是这个账号，需要换号时只改这个值。官方修复免 token login 后改用固定的已登录账号（§5.2），凭据同样只放 Secret |
 | O7 | `billingShopItemRandomBoxGroups` | Haruki 的生成器没映射这个类（类名不带 Master 前缀），原样输出数组；我们按类还原成了对象。是否改成和 Haruki 一样待定 |
 | O8 | 字段顺序 | 24 张表（cn）Haruki 用的是类里的声明顺序，schema.json 没有记录，所以我们的键顺序不同（值相同）。要完全一致需要 builder 在 schema.json 里保留声明顺序 |
+| O10 | ~~jp 的 `compactCards` / `compactGachas`~~ | **已定（2026-11-11）：不生成。** 这是 Haruki 给自家工具做的体积优化，不是游戏数据，StarMoe 下没有项目使用；对外压缩分发由下游负责（S12）。我们的 jp 输出只有服务器给出的表 |
+| O11 | jp 版本文件的 `multiPlayVersion` | Haruki 的 208 个版本文件全是 `miku`（写死的旧值），服务器现在返回 `kaito`；我们用服务器的真实值。Moebot-NEXT 只解析、不依赖具体值 |
 | O9 | ~~内存~~ | **已定（S12）**：按 §7.1 逐表生成、算哈希、只写变化的 blob；实现时测峰值 |
 
 ## 11. 测试
@@ -261,4 +267,12 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - 真实 cn 数据推到本地空裸仓库：第一次提交 432 个表 + 2 个版本文件，全程约 10 秒，仓库 12 MB；clone 出来与 N1 的本地输出逐字节一致。再跑一次判为没有新 master；换一个全新工作目录 `--force` 重写全部表，432 张全部判为没变、不产生提交，工作目录里只有树对象和 `current_version.json` 一个 blob（约 40 KB）。
 - 内存峰值约 1.3 GB（RSS，`--force` 全量还原时），主要是解码后的整份 master；部署时 limit 先按 2 Gi 设，N4 再看是否需要优化。
 - 推到 GitHub `StarMoe-org/moesekai-masterdata-cn`：换到只对该仓库有效的 installation token，第一次提交约 14 秒（RSS 峰值约 1.1 GB）；再跑一次判为没有新 master。从 GitHub 克隆回来与本地输出逐字节一致；工作目录的 `config` 里没有任何凭据。
+
+## 15. N3 结果（2026-11-11）
+
+- 代码：新增 `internal/sega`（game-version、CloudFront cookie、注册、登录、分片下载、账号存储），`master.LayoutSega`、`master.CompareVersions`；`once --region jp [--register]`。
+- 本机实测 jp 7.1.0：注册一个新账号（保存在本机账号文件，0600）→ 登录得到 dataVersion 7.1.0.60、7 个分片 → 写出 417 张表和版本文件，约 39 秒（分片下载占 30 秒），RSS 峰值约 650 MB；再跑一次判为没有新 master。
+- 与 Haruki jp 仓库（同为 7.1.0.60）对照：**417 张表全部逐字节相同**；Haruki 多 2 个派生文件（O10，决定不生成）；版本文件只差 `multiPlayVersion`（O11），其余字段和格式一致。
+- 推到 GitHub `StarMoe-org/moesekai-masterdata-jp`：第一次提交约 42 秒；再跑一次判为没有新 master；克隆回来与本地输出逐字节一致，工作目录 `config` 里没有凭据。
+- 模拟服务器测试覆盖：注册并保存、读已保存的账号、403 后重新拿 cookie 重试、426 / 503 / 500、分片下载、服务器换发 session token、错误信息不含 userId。
 

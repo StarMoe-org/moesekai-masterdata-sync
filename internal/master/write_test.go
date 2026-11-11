@@ -98,3 +98,33 @@ func TestVersionFile(t *testing.T) {
 		t.Errorf("nil 应返回 nil")
 	}
 }
+
+func TestVersionSega(t *testing.T) {
+	// 和 Haruki jp 仓库 versions/7.1.0.60.json 的格式一致
+	v := Version{Layout: LayoutSega, AppHash: "h", SystemProfile: "production", AppVersion: "7.1.0", MultiPlayVersion: "miku",
+		AssetVersion: "7.1.0.60", AppVersionStatus: "available", DataVersion: "7.1.0.60", AssetHash: "a", RemoveAssetVersion: "1.13.0.30"}
+	got, _ := v.Marshal()
+	want := "{\n  \"appHash\": \"h\",\n  \"systemProfile\": \"production\",\n  \"appVersion\": \"7.1.0\",\n  \"multiPlayVersion\": \"miku\",\n" +
+		"  \"assetVersion\": \"7.1.0.60\",\n  \"appVersionStatus\": \"available\",\n  \"dataVersion\": \"7.1.0.60\",\n  \"assetHash\": \"a\",\n" +
+		"  \"removeAssetVersion\": \"1.13.0.30\",\n  \"cdnVersion\": 0\n}"
+	if string(got) != want {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestCompareVersions(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want int
+	}{
+		{"7.1.0.60", "7.1.0.60", 0},
+		{"7.1.0.9", "7.1.0.10", -1},
+		{"7.1.0.60", "7.1.0", 1},
+		{"6.10.0", "6.9.9", 1},
+		{"", "1", -1},
+	} {
+		if got := CompareVersions(c.a, c.b); got != c.want {
+			t.Errorf("Compare(%q, %q) = %d", c.a, c.b, got)
+		}
+	}
+}

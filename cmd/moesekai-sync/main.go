@@ -23,16 +23,19 @@ import (
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/nuverse"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/publish"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/schema"
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/sega"
 )
 
 const usage = `用法：
   moesekai-sync decode --region cn --info <master-data-N.info> --out <目录> [--app-meta <地址>]
       离线：用 app-meta 里当前版本的密钥和结构文件解密、还原一份本地 master，写到 <目录>
-  moesekai-sync once --region cn (--out <目录> | --repo <仓库地址> [--work <目录>]) [--app-meta <地址>] [--force]
+  moesekai-sync once --region cn|jp (--out <目录> | --repo <仓库地址> [--work <目录>]) [--app-meta <地址>] [--force] [--register]
       跑一轮：查当前版本，有新 master 就下载、还原、写出。--repo 时提交并推送（不检出工作目录）
+      jp 没有账号时，加 --register 才会注册一个新账号（先保存到账号文件再使用）
 
 环境变量：
   MOESEKAI_CN_UID（或 _FILE）              cn login 用的已存在账号 id
+  MOESEKAI_JP_ACCOUNT_FILE                 jp 账号文件（JSON，0600；没有时配合 --register 注册）
   GITHUB_APP_ID、GITHUB_APP_PRIVATE_KEY（或 _FILE）   推送到 GitHub 时用
 `
 
@@ -204,17 +207,22 @@ func githubRepo(url string) (string, string, bool) {
 
 func cmdOnce(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("once", flag.ContinueOnError)
-	region := fs.String("region", "", "区服（第一版只支持 cn）")
+	region := fs.String("region", "", "区服：cn 或 jp")
 	out := fs.String("out", "", "写到本地目录")
 	repoURL := fs.String("repo", "", "数据仓库地址（https://github.com/… 或本地裸仓库路径）")
 	work := fs.String("work", "", "--repo 时的本地 git 目录（默认在临时目录下）")
 	base := fs.String("app-meta", "", "app-meta 地址（默认 GitHub raw；file:///路径 表示本地目录）")
-	force := fs.Bool("force", false, "cdnVersion 没变也重新下载、写出")
+	force := fs.Bool("force", false, "版本没变也重新下载、写出")
+	register := fs.Bool("register", false, "jp：没有账号时注册一个")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	if *region != "cn" {
-		return usageError{"once 目前只支持 --region cn（jp 在 N3 实现）"}
+	switch *region {
+	case "cn":
+	case "jp":
+		return onceSega(ctx, *out, *repoURL, *work, *base, *force, *register)
+	default:
+		return usageError{"once 目前只支持 --region cn 或 jp"}
 	}
 	cfg := nuverse.CN
 	uidText, err := secret("MOESEKAI_CN_UID")
@@ -303,4 +311,107 @@ func syncNuverse(ctx context.Context, c *nuverse.Client, b *appmeta.Bundle, t pu
 		return "", err
 	}
 	return t.Finish(ctx, "Sekai master data version "+st.DataVersion)
+}
+
+func onceSega(ctx context.Context, out, repoURL, work, base string, force, register bool) error {
+	accountFile := os.Getenv("MOESEKAI_JP_ACCOUNT_FILE")
+	if accountFile == "" {
+		return usageError{"jp 需要 MOESEKAI_JP_ACCOUNT_FILE"}
+	}
+	b, err := appMetaClient(base).Latest(ctx, "jp")
+	if err != nil {
+		return err
+	}
+	target, err := openTarget(ctx, out, repoURL, work)
+	if err != nil {
+		return err
+	}
+	commit, err := syncSega(ctx, sega.New(sega.JP, b), sega.FileStore(accountFile), register, target, nil, force)
+	if err != nil {
+		return err
+	}
+	if commit != "" {
+		slog.Info("已推送", "commit", commit)
+	}
+	return nil
+}
+
+// syncSega 跑一轮 CP 服：game-version + cookie → 登录 → 比较 dataVersion → 逐个分片写出 → 提交。
+func syncSega(ctx context.Context, c *sega.Client, store sega.AccountStore, register bool, t publish.Target, guard *master.DeleteGuard, force bool) (string, error) {
+	region, m := c.Config.Region, c.Bundle.Meta
+	if err := c.Prepare(ctx); err != nil {
+		return "", err
+	}
+	acct, created, err := sega.EnsureAccount(ctx, c, store, register)
+	if err != nil {
+		return "", err
+	}
+	if created {
+		slog.Warn("已注册新账号并保存", "region", region)
+	}
+	s, err := c.Login(ctx, acct)
+	if errors.Is(err, sega.ErrOutdated) {
+		// N4：这里改成刷新 app-meta、必要时请求 builder（设计文档 §6）
+		return "", fmt.Errorf("app-meta 里的 %s %s 已被服务器淘汰，需要新版本的元数据：%w", region, m.AppVersion, err)
+	}
+	if err != nil {
+		return "", err
+	}
+	slog.Info("login", "region", region, "version", m.AppVersion, "status", s.AppVersionStatus,
+		"dataVersion", s.DataVersion, "assetVersion", s.AssetVersion, "splits", len(s.SplitPaths))
+	cur, err := t.Current(ctx)
+	if err != nil {
+		return "", err
+	}
+	if cur != nil && master.CompareVersions(cur.DataVersion, s.DataVersion) >= 0 && !force {
+		slog.Info("没有新的 master", "region", region, "current", cur.DataVersion)
+		return "", nil
+	}
+	existing := master.TablesIn(t.Files())
+	total := &master.WriteResult{Produced: map[string]bool{}}
+	t0 := time.Now()
+	err = c.Master(ctx, func(split *msgpack.Map) error {
+		for _, k := range split.Keys {
+			if name, _ := k.(string); total.Produced[name] {
+				return fmt.Errorf("表 %s 出现在多个分片里", name)
+			}
+		}
+		res, err := master.WriteTables(t, split)
+		if err != nil {
+			return err
+		}
+		for n := range res.Produced {
+			total.Produced[n] = true
+		}
+		total.Written = append(total.Written, res.Written...)
+		total.Unchanged += res.Unchanged
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	slog.Info("表已生成", "region", region, "tables", len(total.Produced), "changed", len(total.Written),
+		"unchanged", total.Unchanged, "took", time.Since(t0).Round(time.Millisecond))
+	if guard != nil {
+		for _, name := range guard.Decide(existing, total.Produced) {
+			slog.Warn("删除表", "region", region, "table", name)
+			t.Delete("master/" + name + ".json")
+		}
+	}
+	v := master.Version{
+		Layout:             master.LayoutSega,
+		AppHash:            m.AppHash,
+		SystemProfile:      c.Profile(),
+		AppVersion:         s.AppVersion,
+		MultiPlayVersion:   s.MultiPlayVersion,
+		AssetVersion:       s.AssetVersion,
+		AppVersionStatus:   s.AppVersionStatus,
+		DataVersion:        s.DataVersion,
+		AssetHash:          s.AssetHash,
+		RemoveAssetVersion: s.RemoveAssetVersion,
+	}
+	if err := master.WriteVersion(t, v); err != nil {
+		return "", err
+	}
+	return t.Finish(ctx, "Sekai master data version "+s.DataVersion)
 }
