@@ -287,4 +287,6 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - 单元测试：worker（正常间隔、退避翻倍到 30 分钟、维护、过期后请求 builder 并等待、可重试 / 不可重试的回调、app-meta 已有新版本时直接换上）、httpapi、hmacauth（与 Python 独立算出的向量对照）、kube（模拟 API server）。
 - 镜像：GitHub Actions 构建成功（`9432dd704c53`），GHCR 可匿名拉取，Ferry 通知成功。
 - JP2 首次部署（ssh + `kubectl create`）：账号 Secret 先写入本机已注册的 jp 账号，再建变量 Secret 和其余对象。cn 第一轮即正常（判为没有新 master）；jp 因 game-version 403 失败，按上一条修复。
+- 修复（`720597c`）推送后由 Ferry 自动更新到 `720597ceacb2`：jp 回退到默认域名后登录正常，jp、cn 都判为没有新 master，`/healthz` 两个区服都没有失败；空闲时内存约 9Mi。账号 Secret 里的 jp 账号直接使用，没有重新注册。
+- 还没有在线上经历过真实的新 master 和版本过期；builder 的主动发现与 `SYNC_CALLBACK_URL`（builder M6）尚未实现，目前只有本服务发起的请求会收到回调。
 
