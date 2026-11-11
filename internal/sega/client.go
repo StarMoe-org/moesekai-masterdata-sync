@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,19 +24,23 @@ type Config struct {
 	Region          string
 	GameVersionBase string // 例：https://game-version.sekai.colorfulpalette.org
 	IssueBase       string // 例：https://issue.sekai.colorfulpalette.org（拿 CloudFront cookie）
-	Platform        string // X-Platform / 注册时的 platform
-	DeviceModel     string
-	OperatingSystem string
+	// DefaultAPIDomain：game-version 返回 HTTP 错误时用的 API 域名。game-version 对部分机房 IP 返回
+	// CloudFront 403（2026-11-11 JP2 实测），而正式服域名是固定的，游戏 API 本身可以访问。
+	DefaultAPIDomain string
+	Platform         string // X-Platform / 注册时的 platform
+	DeviceModel      string
+	OperatingSystem  string
 }
 
 // JP 是 jp 的默认配置。设备信息是一台普通的 Android 手机。
 var JP = Config{
-	Region:          "jp",
-	GameVersionBase: "https://game-version.sekai.colorfulpalette.org",
-	IssueBase:       "https://issue.sekai.colorfulpalette.org",
-	Platform:        "Android",
-	DeviceModel:     "Google Pixel 7",
-	OperatingSystem: "Android OS 14 / API-34 (AP2A.240805.005/12025142)",
+	Region:           "jp",
+	GameVersionBase:  "https://game-version.sekai.colorfulpalette.org",
+	IssueBase:        "https://issue.sekai.colorfulpalette.org",
+	DefaultAPIDomain: "production-game-api.sekai.colorfulpalette.org",
+	Platform:         "Android",
+	DeviceModel:      "Google Pixel 7",
+	OperatingSystem:  "Android OS 14 / API-34 (AP2A.240805.005/12025142)",
 }
 
 // Account 是一个游戏账号。Credential 相当于密码：只存在账号存储里，不写日志。
@@ -103,17 +108,24 @@ func (c *Client) Prepared() bool { return c.apiBase != "" && c.cookie != "" }
 // Profile 是 game-version 返回的环境名（production）。
 func (c *Client) Profile() string { return c.profile }
 
-// Prepare 查 game-version 拿 API 域名，再拿 CloudFront cookie。每轮开始时调用。
+// Prepare 查 game-version 拿 API 域名，再拿 CloudFront cookie。第一轮和换版本时调用。
+// game-version 返回 HTTP 错误（不含 426 / 503）且配置了 DefaultAPIDomain 时，改用默认域名继续。
 func (c *Client) Prepare(ctx context.Context) error {
 	m := c.Bundle.Meta
 	var gv struct {
 		Profile, Domain, AssetbundleHostHash string
 	}
-	if err := c.call(ctx, http.MethodGet, c.Config.GameVersionBase+"/"+m.AppVersion+"/"+m.AppHash, nil, func(v *msgpack.Map) {
+	err := c.call(ctx, http.MethodGet, c.Config.GameVersionBase+"/"+m.AppVersion+"/"+m.AppHash, nil, func(v *msgpack.Map) {
 		gv.Profile, _ = get(v, "profile").(string)
 		gv.Domain, _ = get(v, "domain").(string)
 		gv.AssetbundleHostHash, _ = get(v, "assetbundleHostHash").(string)
-	}); err != nil {
+	})
+	var he *HTTPError
+	if errors.As(err, &he) && c.Config.DefaultAPIDomain != "" {
+		slog.Warn("game-version 不可用，改用默认 API 域名", "region", c.Config.Region, "status", he.Status, "domain", c.Config.DefaultAPIDomain)
+		gv.Profile, gv.Domain, err = "production", c.Config.DefaultAPIDomain, nil
+	}
+	if err != nil {
 		return fmt.Errorf("game-version：%w", err)
 	}
 	if gv.Domain == "" {

@@ -234,3 +234,26 @@ func TestMasterRejectsBadPath(t *testing.T) {
 		t.Error("带 .. 的分片路径应报错")
 	}
 }
+
+// game-version 被 CloudFront 拦截（403）时改用默认域名；426 仍然报过期。
+func TestGameVersionFallback(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(t)
+	cfg := JP
+	cfg.GameVersionBase, cfg.IssueBase = f.srv.URL+"/blocked", f.srv.URL
+	cfg.DefaultAPIDomain = strings.TrimPrefix(f.srv.URL, "https://")
+	c := New(cfg, testBundle())
+	c.HTTP = f.srv.Client()
+	if err := c.Prepare(ctx); err != nil || !c.Prepared() || c.Profile() != "production" {
+		t.Fatalf("应改用默认域名：%v", err)
+	}
+	if _, err := c.Login(ctx, &Account{UserID: 1234, Credential: "cred", InstallID: "i"}); err != nil {
+		t.Fatalf("默认域名上登录：%v", err)
+	}
+	cfg.DefaultAPIDomain = ""
+	c = New(cfg, testBundle())
+	c.HTTP = f.srv.Client()
+	if err := c.Prepare(ctx); err == nil {
+		t.Error("没有默认域名时应报错")
+	}
+}

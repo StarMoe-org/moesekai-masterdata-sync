@@ -109,6 +109,7 @@ GET  https://{domain}/api/{suiteMasterSplitPath[i]}            → 逐个分片�
 - 请求头：`X-App-Version`、`X-App-Hash`、`X-Data-Version`、`X-Asset-Version`、`X-Unity-Version`、`X-Platform`、`X-DeviceModel`、`X-OperatingSystem`、`X-Install-Id`、`X-Request-Id`、`X-Session-Token`。
 - 状态码：403 → 重新拿 cookie、重新登录一次；**426 → 版本过期（§6）**；503 → 维护，退避。
 - 2026-11-11 实测（jp 7.1.0，本机）：game-version 返回 `profile=production`、`domain`、`assetbundleHostHash`；`issue/api/signature` 的响应体是 `{}`，Set-Cookie 里有 `CloudFront-Policy` / `-Signature` / `-Key-Pair-Id` 三项，拼成 Cookie 后 API 才不再返回 CloudFront 的 403。
+- **game-version 对 JP2 的 IP 返回 CloudFront 403**（2026-11-11 实测；本机正常，issue 和游戏 API 在 JP2 上都能访问）。game-version 只用来拿 API 域名，正式服域名固定为 `production-game-api.sekai.colorfulpalette.org`，所以 game-version 返回 HTTP 错误时记告警、改用这个默认域名（`sega.Config.DefaultAPIDomain`）。JP2 节点上实测回退后登录、下载 417 张表正常。
 - **`GET /api/system` 只要 cookie、不用登录**，返回全部 appVersion（当前 100 条）及各自的 `appVersionStatus`、`assetVersion`、`multiPlayVersion`；目前只有 7.1.0 是 `available`。新版本上线时会出现在这里，可作为 jp 的新版本信号（比登录便宜），交给 builder M6 参考。
 - Haruki jp 仓库的输出与 cn 不同：版本文件字段顺序为 appHash, systemProfile, appVersion, multiPlayVersion, assetVersion, appVersionStatus, dataVersion, assetHash, removeAssetVersion, cdnVersion（恒为 0）；表内键保持服务器顺序，不排序；另有 `compactCards` / `compactGachas`，**不是服务器的数据**，是 Haruki-Sekai-API 自己生成的派生文件（`cards` / `gachas` 里的 `cardParameters` / `gachaDetails` 改成按列存放，给 Haruki-Toolbox 减小下载体积），见 O10。实现见 `master.LayoutSega`；对照结果见 §15。
 - 本机用 `MOESEKAI_JP_ACCOUNT_FILE`（JSON，0600）保存账号；`once` 只有加 `--register` 才会注册。
@@ -284,5 +285,6 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - 部署文件：`Dockerfile`（golang:1.27-alpine 交叉编译 → alpine:3.22 + git 2.49，非 root）、`deploy/k8s.yaml`（ServiceAccount、空的账号 Secret、只能 get / patch 这一个 Secret 的 Role、Deployment、Service）、`deploy/README.md`；`deploy.yml` 与 StarMoe 模板逐字节相同，仓库能读到组织级的 `CNB_TOKEN`。
 - 本机演练：`serve` 推到两个本地空裸仓库（间隔 30 秒、不接 builder），首轮 jp、cn 依次全量写出并提交，之后每轮都判为没有新 master；jp 第二轮起只发登录请求；签名回调 204、错误签名 401；`/healthz`、`/metrics` 输出正确；SIGTERM 后 3 秒内退出，全程无错误日志。
 - 单元测试：worker（正常间隔、退避翻倍到 30 分钟、维护、过期后请求 builder 并等待、可重试 / 不可重试的回调、app-meta 已有新版本时直接换上）、httpapi、hmacauth（与 Python 独立算出的向量对照）、kube（模拟 API server）。
-- 未做：镜像构建（本机没有 docker，第一次由 GitHub Actions 构建）、JP2 首次部署。
+- 镜像：GitHub Actions 构建成功（`9432dd704c53`），GHCR 可匿名拉取，Ferry 通知成功。
+- JP2 首次部署（ssh + `kubectl create`）：账号 Secret 先写入本机已注册的 jp 账号，再建变量 Secret 和其余对象。cn 第一轮即正常（判为没有新 master）；jp 因 game-version 403 失败，按上一条修复。
 
