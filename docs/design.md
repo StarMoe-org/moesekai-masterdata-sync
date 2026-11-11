@@ -234,7 +234,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 | O5 | ~~首次导入~~ | **已定（2026-11-11）**：数据仓库从空仓库开始，第一次运行提交当前完整的 master 和版本文件，不导入 Haruki 的历史 |
 | O6 | ~~cn login 用哪个账号的 uid~~ | **已定（2026-11-11）**：用户自己的国服账号 uid（只用 id，不用 token），放在服务的 Secret `MOESEKAI_CN_UID`；值不进仓库、不写日志。被风控时影响的是这个账号，需要换号时只改这个值。官方修复免 token login 后改用固定的已登录账号（§5.2），凭据同样只放 Secret |
 | O7 | ~~`billingShopItemRandomBoxGroups`~~ | **已定（2026-11-12）：保持对象格式**（`{id, randomBoxGroupId, resourceBoxId, rate}`），与其他表一致。Haruki（sc / tc / kr）和 Sekai-World 的 sekai-client 输出无字段名的数组，只是因为它们的结构生成器拿不到这个类（类名不带 Master 前缀）的字段名，不是有意为之；值完全相同。只有 Nuverse 系的服有这张表，StarMoe 下没有项目使用 |
-| O8 | 字段顺序 | 24 张表（cn）Haruki 用的是类里的声明顺序，schema.json 没有记录，所以我们的键顺序不同（值相同）。要完全一致需要 builder 在 schema.json 里保留声明顺序 |
+| O8 | ~~字段顺序~~ | **已定（2026-11-12）：不要求与 Haruki 一致。** cn 有 24 张表 Haruki 用类里的声明顺序，我们按字段名排序（schema.json 不记录声明顺序），值相同；不为此改 builder 的 schema.json 格式 |
 | O10 | ~~jp 的 `compactCards` / `compactGachas`~~ | **已定（2026-11-11）：不生成。** 这是 Haruki 给自家工具做的体积优化，不是游戏数据，StarMoe 下没有项目使用；对外压缩分发由下游负责（S12）。我们的 jp 输出只有服务器给出的表 |
 | O11 | jp 版本文件的 `multiPlayVersion` | Haruki 的 208 个版本文件全是 `miku`（写死的旧值），服务器现在返回 `kaito`；我们用服务器的真实值。Moebot-NEXT 只解析、不依赖具体值 |
 | O9 | ~~内存~~ | **已定（S12）**：按 §7.1 逐表生成、算哈希、只写变化的 blob；实现时测峰值 |
