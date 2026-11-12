@@ -42,6 +42,37 @@ var CN = Config{
 	Platform: "Android",
 }
 
+// HMT 是繁中服（Nuverse，ByteDance 海外）。CDN 基址和 serverId 2026-11-12 实测确认
+// （serverId 60001，与 cn 相同；gdl_app_5245）。master 下载、解码、还原已验证（与 Haruki tc 一致）。
+// APIBase（login 查版本用）来自 sssekai，尚未实测；登录需要一个已存在账号的 uid（见 §5.2，与 cn 同理）。
+var HMT = Config{
+	Region:  "hmt",
+	APIBase: "https://mkovs-20004-cdn.bytedgame.com/api/",
+	CDNBases: []string{
+		"https://lf16-mkovscdn-sg.bytedgame.com/obj/sf-game-alisg/gdl_app_5245/AssetBundle/",
+		"https://lf19-mkovscdn-sg.bytedgame.com/obj/sf-game-alisg/gdl_app_5245/AssetBundle/",
+		"https://lf21-mkovscdn-sg.bytedgame.com/obj/sf-game-alisg/gdl_app_5245/AssetBundle/",
+	},
+	ServerID: 60001,
+	Platform: "Android",
+}
+
+// KR 是韩服（Nuverse）。CDN 基址和 serverId 2026-11-12 实测确认（serverId 60001；gdl_app_292248）。
+// APIBase 来自 sssekai（mkkorea-obt-prod01，obt 可能过时），尚未实测；登录需要已存在账号的 uid。
+var KR = Config{
+	Region:  "kr",
+	APIBase: "https://mkkorea-obt-prod01-cdn.bytedgame.com/api/",
+	CDNBases: []string{
+		"https://lf16-mkkr.bytedgame.com/obj/sf-game-alisg/gdl_app_292248/AssetBundle/",
+		"https://lf19-mkkr.bytedgame.com/obj/sf-game-alisg/gdl_app_292248/AssetBundle/",
+	},
+	ServerID: 60001,
+	Platform: "Android",
+}
+
+// Configs 是所有 Nuverse 服的配置，按区服索引。
+var Configs = map[string]Config{"cn": CN, "hmt": HMT, "kr": KR}
+
 // Status 是 login 响应里本服务用到的字段。
 type Status struct {
 	HTTPStatus       int

@@ -47,7 +47,6 @@ type serveConfig struct {
 	CallbackURL string
 	HMACSecret  []byte
 	AccountName string // jp 账号 Secret
-	AccountFile string // 本机调试：用文件代替 Secret
 	Register    bool
 	Listen      string
 }
@@ -61,7 +60,6 @@ func loadServeConfig() (*serveConfig, error) {
 		BuilderURL:  env("BUILDER_URL", "http://pjsk-meta-builder.apps.svc.cluster.local:8080"),
 		CallbackURL: env("SYNC_CALLBACK_URL", "http://moesekai-masterdata-sync.apps.svc.cluster.local:8080/v1/app-meta/callback"),
 		AccountName: env("ACCOUNT_SECRET_NAME", "moesekai-masterdata-sync-accounts"),
-		AccountFile: os.Getenv("MOESEKAI_JP_ACCOUNT_FILE"),
 		Register:    env("MOESEKAI_JP_REGISTER", "true") == "true",
 		Listen:      ":" + env("PORT", "8080"),
 	}
@@ -70,8 +68,8 @@ func loadServeConfig() (*serveConfig, error) {
 		if r == "" {
 			continue
 		}
-		if r != "jp" && r != "cn" {
-			return nil, usageError{fmt.Sprintf("MOESEKAI_REGIONS：不支持的区服 %q（目前只有 jp、cn）", r)}
+		if !segaRegion(r) && !nuverseRegion(r) {
+			return nil, usageError{fmt.Sprintf("MOESEKAI_REGIONS：不支持的区服 %q（可选：jp en cn hmt kr）", r)}
 		}
 		up := strings.ToUpper(r)
 		d, err := time.ParseDuration(env("MOESEKAI_POLL_"+up, "5m"))
@@ -175,14 +173,13 @@ func newRunner(region string, cfg *serveConfig, repo *gitrepo.Repo) (worker.Runn
 			slog.Info("本地仓库副本过大，已清空（下轮重新拉取目录树）", "region", region)
 		}
 	}
-	switch region {
-	case "cn":
-		ncfg, err := cnConfig()
+	if nuverseRegion(region) {
+		ncfg, err := nuverseConfig(region)
 		if err != nil {
 			return nil, err
 		}
 		if ncfg.UserID == 0 {
-			return nil, usageError{"cn 需要 MOESEKAI_CN_UID（或 _FILE）"}
+			return nil, usageError{region + " 需要 MOESEKAI_" + strings.ToUpper(region) + "_UID（或 _FILE）"}
 		}
 		client := nuverse.New(ncfg)
 		return worker.RunnerFunc(func(ctx context.Context, b *appmeta.Bundle) (*syncer.Result, error) {
@@ -194,31 +191,31 @@ func newRunner(region string, cfg *serveConfig, repo *gitrepo.Repo) (worker.Runn
 			after(res)
 			return res, err
 		}), nil
-
-	case "jp":
-		var store sega.AccountStore
-		if cfg.AccountFile != "" {
-			store = sega.FileStore(cfg.AccountFile)
-		} else {
-			sc, err := kube.InCluster(cfg.AccountName)
-			if err != nil {
-				return nil, fmt.Errorf("jp 账号存储：%w（本机运行请设 MOESEKAI_JP_ACCOUNT_FILE）", err)
-			}
-			store = &kube.AccountStore{Secret: sc, Region: region}
-		}
-		var client *sega.Client
-		return worker.RunnerFunc(func(ctx context.Context, b *appmeta.Bundle) (*syncer.Result, error) {
-			if client == nil || client.Bundle != b {
-				client = sega.New(sega.JP, b) // 新版本：重新查 game-version、拿 cookie
-			}
-			t, err := publish.OpenGit(ctx, repo)
-			if err != nil {
-				return nil, err
-			}
-			res, err := syncer.Sega(ctx, client, store, cfg.Register, t, syncer.Options{Guard: guard})
-			after(res)
-			return res, err
-		}), nil
 	}
-	return nil, fmt.Errorf("不支持的区服 %s", region)
+
+	// CP 服（jp / en）：账号存 Secret，本机可用 MOESEKAI_<区服>_ACCOUNT_FILE 代替
+	var store sega.AccountStore
+	if f := os.Getenv("MOESEKAI_" + strings.ToUpper(region) + "_ACCOUNT_FILE"); f != "" {
+		store = sega.FileStore(f)
+	} else {
+		sc, err := kube.InCluster(cfg.AccountName)
+		if err != nil {
+			return nil, fmt.Errorf("%s 账号存储：%w（本机运行请设 MOESEKAI_%s_ACCOUNT_FILE）", region, err, strings.ToUpper(region))
+		}
+		store = &kube.AccountStore{Secret: sc, Region: region}
+	}
+	segaCfg := sega.Configs[region]
+	var client *sega.Client
+	return worker.RunnerFunc(func(ctx context.Context, b *appmeta.Bundle) (*syncer.Result, error) {
+		if client == nil || client.Bundle != b {
+			client = sega.New(segaCfg, b) // 新版本：重新查 game-version、拿 cookie
+		}
+		t, err := publish.OpenGit(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		res, err := syncer.Sega(ctx, client, store, cfg.Register, t, syncer.Options{Guard: guard})
+		after(res)
+		return res, err
+	}), nil
 }

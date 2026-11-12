@@ -43,6 +43,21 @@ var JP = Config{
 	OperatingSystem:  "Android OS 14 / API-34 (AP2A.240805.005/12025142)",
 }
 
+// EN 是 en（Global 服，CP 体系）的默认配置。地址与 jp 平行，profile 前缀 n-；
+// 2026-11-12 实测 game-version、signature、/api/system 均正常。
+var EN = Config{
+	Region:           "en",
+	GameVersionBase:  "https://game-version.sekai-en.com",
+	IssueBase:        "", // en 的游戏 API 不走 CloudFront 签名 cookie（2026-11-12 实测 /api/system 无 cookie 即 200）
+	DefaultAPIDomain: "n-production-game-api.sekai-en.com",
+	Platform:         "Android",
+	DeviceModel:      "Google Pixel 7",
+	OperatingSystem:  "Android OS 14 / API-34 (AP2A.240805.005/12025142)",
+}
+
+// Configs 是所有 CP 服（Sega）的配置，按区服索引。
+var Configs = map[string]Config{"jp": JP, "en": EN}
+
 // Account 是一个游戏账号。Credential 相当于密码：只存在账号存储里，不写日志。
 type Account struct {
 	UserID       int64  `json:"userId"`
@@ -103,7 +118,9 @@ func New(cfg Config, b *appmeta.Bundle) *Client {
 }
 
 // Prepared 表示已经拿到 API 域名和 cookie（之后的轮次可以跳过 Prepare）。
-func (c *Client) Prepared() bool { return c.apiBase != "" && c.cookie != "" }
+func (c *Client) Prepared() bool {
+	return c.apiBase != "" && (c.Config.IssueBase == "" || c.cookie != "")
+}
 
 // Profile 是 game-version 返回的环境名（production）。
 func (c *Client) Profile() string { return c.profile }
@@ -139,6 +156,9 @@ func (c *Client) Prepare(ctx context.Context) error {
 // refreshCookie 调 issue 的 signature 接口，把 Set-Cookie 里的 CloudFront-* 拼成 Cookie 请求头。
 func (c *Client) refreshCookie(ctx context.Context) error {
 	c.cookie = ""
+	if c.Config.IssueBase == "" {
+		return nil // 这个区服不需要 CloudFront cookie（如 en）
+	}
 	resp, _, err := c.send(ctx, http.MethodPost, c.Config.IssueBase+"/api/signature", nil)
 	if err != nil {
 		return fmt.Errorf("signature：%w", err)

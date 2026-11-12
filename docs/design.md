@@ -93,7 +93,11 @@
 
 ## 5. 各区服的拉取流程
 
-### 5.1 jp（CP 服）——需要账号
+### 5.1 jp / en（CP 服）——需要账号，可匿名注册
+
+jp 和 en 共用 `internal/sega`。en 与 jp 平行（`game-version.sekai-en.com`、API 域名由 game-version 下发、profile 前缀 `n-`），
+但 **en 的游戏 API 不走 CloudFront 签名 cookie**（2026-11-12 实测 `/api/system` 无 cookie 即 200；sega 配置里 en 的 `IssueBase` 为空，跳过 signature）。
+两者都能用 `POST /api/user`（设备信息）匿名注册拿到 `credential`，无需第三方。
 
 ```
 GET  https://game-version.<domain>/{appVersion}/{appHash}     → profile、domain、assetbundleHostHash
@@ -115,7 +119,7 @@ GET  https://{domain}/api/{suiteMasterSplitPath[i]}            → 逐个分片�
 - 本机用 `MOESEKAI_JP_ACCOUNT_FILE`（JSON，0600）保存账号；`once` 只有加 `--register` 才会注册。
 - **自动注册**：账号 Secret 里没有账号时，`POST /api/user`（`{platform, deviceModel, operatingSystem}`）→ `userId`、`credential`；**先写入 Secret 成功，再使用**。账号失效（登录 401/403 重试后仍失败）时报告警，不自动换号。
 
-### 5.2 cn（Nuverse 服）——不需要账号
+### 5.2 cn / hmt / kr（Nuverse 服）
 
 > **临时方案。** 下面的免 token login 是服务端鉴权的缺陷，已报告官方（2026-11-11）。官方修复后改为用一个固定的、已登录的账号拉取（带会话凭据），凭据放在 Secret；届时 cn 的流程向 jp 靠拢（登录 → 拿会话 → 请求）。在那之前 `nuverse.Client.Login` 仍按下面的方式工作；修复上线后免 token login 会开始失败（具体状态码未知），应报警而不是重试。
 
@@ -132,6 +136,13 @@ GET  {CDN}/MasterData/60001/master-data-{cdnVersion}.info     → [0] 密钥解�
 ```
 
 - **uid 必须是已存在的账号**（只要 id，不要它的 token）。随机生成的 id（Unix 毫秒 << 22 + 随机低位，形式与真实 id 相同）实测返回 500。配置为 `MOESEKAI_CN_UID`（§10 O6）。
+
+**hmt（繁中）/ kr（韩）**（2026-11-12 静态分析 hmt 6.4.0 安装包 + 实测 CDN 确认）：
+- 与 cn 同一套客户端代码：`UserLoginResponse` 字段相同，login 为 `POST user/{uid}/login`（空体），服务器先查版本再验 auth。master 下载、解密、还原与 cn 完全一致。
+- **CDN 基址和 serverId 已确认**：hmt `lf{16,19,21}-mkovscdn-sg.bytedgame.com/obj/sf-game-alisg/gdl_app_5245/`，kr `lf{16,19}-mkkr.bytedgame.com/obj/sf-game-alisg/gdl_app_292248/`；**serverId 都是 60001**（与 cn 相同）。master 文件直接从 CDN 取，不需要账号。取 hmt 284 / kr 315 解码还原，与 Haruki tc / kr 对照：各 407 张表逐字节相同，24 张只差字段顺序（O8），1 张是 `billingShopItemRandomBoxGroups`（O7）——与 cn 结论一致。
+- **login 的 API 基址来自 Bytedance GSDK 下发的 zones 列表，不在安装包里**；代码里的默认值：hmt `mkovs-20004-cdn.bytedgame.com`、kr `mkkorea-obt-prod01-cdn.bytedgame.com`（kr 经确认是现网地址），可用 `MOESEKAI_HMT_API` / `MOESEKAI_KR_API` 覆盖。
+- **kr login 被拒（2026-11-12，未解决）**：用已存在账号的 uid 实测，`GET api/system` 200 且能用 [0] 密钥解密（地址、密钥都对），`GET user/{uid}/login` 405（路由存在），但 `POST user/{uid}/login` 不论请求体（空、空 map、nil、带 accessToken / deviceId）都返回**空的 400**，像在网关层就被拒；与 cn 相比，推测缺少 GSDK 生成的请求头。等真机抓包后再分析；拿不到时改用「CDN 往上探」：CDN 保留旧 `.info`，从当前 cdnVersion 往上请求到 404 即可免账号发现最新版本（hmt 284 / kr 315 已验证）。
+- **匿名注册不可行**：游戏账号的 `credential` 经 `RegisterUser`（`POST user` → userRegistration+credential）取得，但注册与 `user/auth` 都在 Bytedance GSDK 的渠道登录之后，`accessToken` 由闭源 SDK 产出（游客登录也在 SDK 内部完成，并顺带下发 zones/API 基址）。要「匿名注册」等于重做 Bytedance SDK 的握手，不只是游戏 HTTP 协议。因此 hmt/kr 的版本探测需要**一个已存在账号的 uid**（`MOESEKAI_HMT_UID` / `MOESEKAI_KR_UID`，与 cn 同理）；master 本身的下载不需要账号。
 - CDN 是客户端 `AssetBundleManager.GetMasterDataUrl` 的拼法：`CDNList[随机].Replace("AssetBundle","MasterData") + serverId + "/master-data-{cdnVersion}.info"`。安装包里写死 4 个：`https://lf{3,6,9,26}-mkcncdn-tos.dailygn.com/obj/sf-game-lf/gdl_app_5236/AssetBundle/`；随机选一个，失败换下一个。四个地址 ETag 相同。
 - 实测：当前版本 `6.4.1.4647` 和 `6.4.0.4424` 都返回 `available`，`dataVersion`（6.4.1.6）和 `cdnVersion`（186）相同；`6.0.0.x` 返回 **426**、`not_available`，响应用 [1] 密钥加密。**响应里的 `appVersion` 只是回显请求的版本，不是最新版本。**
 - 所以这个接口只能发现「手上的版本被淘汰了」，发现不了「新版本已上架」——后者由 builder 负责（§6）。
@@ -213,8 +224,11 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 | `MOE_HMAC_SECRET`（或 `_FILE`） | Secret | 与 builder 共用 |
 | `GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY` | Secret | `moesekai-bot` |
 | `BUILDER_URL` | 配置 | 默认 `http://pjsk-meta-builder.apps.svc.cluster.local:8080` |
-| `MOESEKAI_REGIONS` | 配置 | 默认 `jp,cn` |
+| `MOESEKAI_REGIONS` | 配置 | 默认 `jp,cn`；可加 `en,hmt,kr` |
 | `MOESEKAI_POLL_<REGION>` | 配置 | 拉 master 的间隔（§10 O4） |
+| `MOESEKAI_<区服>_UID`（Nuverse：cn/hmt/kr） | Secret | login 查版本用的已存在账号 id（只用 id） |
+| `MOESEKAI_<区服>_API`（hmt/kr，可选） | 配置 | 覆盖 login 的 API 基址 |
+| `MOESEKAI_<区服>_ACCOUNT_FILE`（CP：jp/en，本机调试） | 文件 | 账号 JSON；serve 在集群里用账号 Secret 代替 |
 | 各区服的域名、设备信息 | 配置 | jp 的 game-version / issue 域名，cn 的 API 地址和 CDN 列表；示例配置里用占位符 |
 | `ACCOUNT_SECRET_NAME` | 配置 | 默认 `moesekai-masterdata-sync-accounts` |
 
@@ -278,6 +292,13 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - 与 Haruki jp 仓库（同为 7.1.0.60）对照：**417 张表全部逐字节相同**；Haruki 多 2 个派生文件（O10，决定不生成）；版本文件只差 `multiPlayVersion`（O11），其余字段和格式一致。
 - 推到 GitHub `StarMoe-org/moesekai-masterdata-jp`：第一次提交约 42 秒；再跑一次判为没有新 master；克隆回来与本地输出逐字节一致，工作目录 `config` 里没有凭据。
 - 模拟服务器测试覆盖：注册并保存、读已保存的账号、403 后重新拿 cookie 重试、426 / 503 / 500、分片下载、服务器换发 session token、错误信息不含 userId。
+
+## 17. 多区服（N5，2026-11-12）
+
+- en：接入 `internal/sega`（配置 `sega.EN`），匿名注册同 jp，不走 CloudFront cookie。本机实测 game-version / `/api/system` 正常。
+- hmt / kr：接入 `internal/nuverse`（`HMT` / `KR`），CDN 与 serverId 实测确认，decode/还原与 Haruki 一致；kr login 实测返回空 400，**暂停，等抓包**（§5.2）。
+- `once` 和 `serve` 的区服按协议归类选配置（`sega.Configs` / `nuverse.Configs`），env 变量按区服名展开。
+- **待用户执行**：en 注册账号跑通 `once`、推 en 数据仓库；hmt/kr 等抓包分析 login，或改走 CDN 往上探。
 
 ## 16. N4 进度（2026-11-11）
 

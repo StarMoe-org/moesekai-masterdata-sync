@@ -32,6 +32,7 @@ type fakeServer struct {
 	srv         *httptest.Server
 	key         crypto.Key
 	forbidFirst int  // 登录先返回几次 403
+	noCookie    bool // true 时不要求 CloudFront cookie（模拟 en）
 	status      int  // 非 0 时登录直接返回这个状态码
 	cookieOK    bool // 已发过 cookie
 	logins      int
@@ -81,7 +82,7 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Signature", Value: "s"})
 		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Key-Pair-Id", Value: "k"})
 		w.Write([]byte("{}\n"))
-	case h.Get("Cookie") != "CloudFront-Policy=p; CloudFront-Signature=s; CloudFront-Key-Pair-Id=k":
+	case !f.noCookie && h.Get("Cookie") != "CloudFront-Policy=p; CloudFront-Signature=s; CloudFront-Key-Pair-Id=k":
 		w.WriteHeader(http.StatusForbidden)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/user":
 		b := f.body(r)
@@ -236,6 +237,23 @@ func TestMasterRejectsBadPath(t *testing.T) {
 }
 
 // game-version 被 CloudFront 拦截（403）时改用默认域名；426 仍然报过期。
+func TestNoCookieRegion(t *testing.T) {
+	// IssueBase 为空（如 en）：不请求 signature，Prepare 后即就绪
+	ctx := context.Background()
+	f := newFake(t)
+	f.noCookie = true
+	cfg := JP
+	cfg.GameVersionBase, cfg.IssueBase = f.srv.URL, ""
+	c := New(cfg, testBundle())
+	c.HTTP = f.srv.Client()
+	if err := c.Prepare(ctx); err != nil || !c.Prepared() {
+		t.Fatalf("无 cookie 区服 Prepare：%v", err)
+	}
+	if _, err := c.Login(ctx, &Account{UserID: 1234, Credential: "cred", InstallID: "i"}); err != nil {
+		t.Fatalf("无 cookie 登录：%v", err)
+	}
+}
+
 func TestGameVersionFallback(t *testing.T) {
 	ctx := context.Background()
 	f := newFake(t)

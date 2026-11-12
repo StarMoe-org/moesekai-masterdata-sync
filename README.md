@@ -10,9 +10,10 @@ Project SEKAI 各区服 master data 的同步服务：从游戏服务器拉取�
 
 | 区服 | 状态 |
 | --- | --- |
-| cn | 可用（`once`） |
 | jp | 可用（`once`；首次运行加 `--register` 注册账号） |
-| en / hmt / kr | 未开始 |
+| en | 已接入（CP 服，同 jp；首次 `--register`），待实测 |
+| cn | 可用（`once`） |
+| hmt / kr | 已接入（Nuverse，同 cn），master 解码已验证；kr login 返回 400，暂停，等抓包分析 |
 
 ## 用法
 
@@ -31,6 +32,6 @@ MOESEKAI_CN_UID_FILE=… GITHUB_APP_ID=… GITHUB_APP_PRIVATE_KEY_FILE=… \
 
 | 环境变量 | 说明 |
 | --- | --- |
-| `MOESEKAI_CN_UID`（或 `_FILE`） | cn login 用的已存在账号 id |
-| `MOESEKAI_JP_ACCOUNT_FILE` | jp 账号文件（JSON，0600）；不存在时配合 `--register` 注册一个 |
+| `MOESEKAI_<区服>_UID`（cn/hmt/kr，或 `_FILE`） | Nuverse login 用的已存在账号 id |
+| `MOESEKAI_<区服>_ACCOUNT_FILE`（jp/en） | CP 服账号文件（JSON，0600）；不存在时配合 `--register` 注册 |
 | `GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY`（或 `_FILE`） | 推送到 GitHub 时用；token 只申请目标仓库一个 |

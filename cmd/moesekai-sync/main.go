@@ -30,16 +30,17 @@ var version = "dev"
 const usage = `用法：
   moesekai-sync serve
       常驻服务：按间隔同步各区服并推送到数据仓库；HTTP 提供 /healthz /metrics 和 builder 回调（配置见 README）
-  moesekai-sync once --region cn|jp (--out <目录> | --repo <仓库地址> [--work <目录>]) [--app-meta <地址>] [--force] [--register]
+  moesekai-sync once --region jp|en|cn|hmt|kr (--out <目录> | --repo <仓库地址> [--work <目录>]) [--app-meta <地址>] [--force] [--register]
       跑一轮：查当前版本，有新 master 就下载、还原、写出。--repo 时提交并推送（不检出工作目录）
-      jp 没有账号时，加 --register 才会注册一个新账号（先保存到账号文件再使用）
+      jp / en 没有账号时，加 --register 才会注册一个新账号（先保存到账号文件再使用）
   moesekai-sync decode --region cn --info <master-data-N.info> --out <目录> [--app-meta <地址>]
       离线：用 app-meta 里当前版本的密钥和结构文件解密、还原一份本地 master，写到 <目录>
   moesekai-sync version
 
 环境变量（once）：
-  MOESEKAI_CN_UID（或 _FILE）              cn login 用的已存在账号 id
-  MOESEKAI_JP_ACCOUNT_FILE                 jp 账号文件（JSON，0600；没有时配合 --register 注册）
+  MOESEKAI_<区服>_UID（或 _FILE）          cn / hmt / kr login 用的已存在账号 id
+  MOESEKAI_<区服>_API                      hmt / kr：覆盖 login 的 API 地址（可选）
+  MOESEKAI_<区服>_ACCOUNT_FILE             jp / en 账号文件（JSON，0600；没有时配合 --register 注册）
   GITHUB_APP_ID、GITHUB_APP_PRIVATE_KEY（或 _FILE）   推送到 GitHub 时用
 `
 
@@ -106,20 +107,32 @@ func appMetaClient(base string) *appmeta.Client {
 	return c
 }
 
-// cnConfig 读 MOESEKAI_CN_UID。
-func cnConfig() (nuverse.Config, error) {
-	cfg := nuverse.CN
-	uidText, err := secret("MOESEKAI_CN_UID")
+// nuverseConfig 取某个 Nuverse 服的配置：uid 来自 MOESEKAI_<区服>_UID（必填），
+// login 的 API 地址可用 MOESEKAI_<区服>_API 覆盖。
+func nuverseConfig(region string) (nuverse.Config, error) {
+	cfg, ok := nuverse.Configs[region]
+	if !ok {
+		return cfg, usageError{region + " 不是 Nuverse 服"}
+	}
+	up := strings.ToUpper(region)
+	uidText, err := secret("MOESEKAI_" + up + "_UID")
 	if err != nil {
 		return cfg, err
 	}
 	if uidText != "" {
 		if cfg.UserID, err = strconv.ParseUint(uidText, 10, 64); err != nil {
-			return cfg, usageError{"MOESEKAI_CN_UID 不是数字"}
+			return cfg, usageError{"MOESEKAI_" + up + "_UID 不是数字"}
 		}
+	}
+	if api := os.Getenv("MOESEKAI_" + up + "_API"); api != "" {
+		cfg.APIBase = api
 	}
 	return cfg, nil
 }
+
+// segaRegion / nuverseRegion 判断区服属于哪套协议。
+func segaRegion(r string) bool    { _, ok := sega.Configs[r]; return ok }
+func nuverseRegion(r string) bool { _, ok := nuverse.Configs[r]; return ok }
 
 // githubApp 读 GitHub App 配置；没配置时返回 nil。
 func githubApp() (*ghapp.App, error) {
@@ -193,18 +206,18 @@ func cmdDecode(ctx context.Context, args []string) error {
 
 func cmdOnce(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("once", flag.ContinueOnError)
-	region := fs.String("region", "", "区服：cn 或 jp")
+	region := fs.String("region", "", "区服：jp en cn hmt kr")
 	out := fs.String("out", "", "写到本地目录")
 	repoURL := fs.String("repo", "", "数据仓库地址（https://github.com/… 或本地裸仓库路径）")
 	work := fs.String("work", "", "--repo 时的本地 git 目录（默认在临时目录下）")
 	base := fs.String("app-meta", "", "app-meta 地址（默认 GitHub raw；file:///路径 表示本地目录）")
 	force := fs.Bool("force", false, "版本没变也重新下载、写出")
-	register := fs.Bool("register", false, "jp：没有账号时注册一个")
+	register := fs.Bool("register", false, "jp / en：没有账号时注册一个")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	if *region != "cn" && *region != "jp" {
-		return usageError{"once 目前只支持 --region cn 或 jp"}
+	if !segaRegion(*region) && !nuverseRegion(*region) {
+		return usageError{"未知区服（可选：jp en cn hmt kr）"}
 	}
 
 	var target publish.Target
@@ -218,18 +231,17 @@ func cmdOnce(ctx context.Context, args []string) error {
 	}
 
 	// 先检查各区服自己的配置，再访问网络
-	var cnCfg nuverse.Config
+	var nvCfg nuverse.Config
 	var store sega.AccountStore
-	switch *region {
-	case "cn":
+	if nuverseRegion(*region) {
 		var err error
-		if cnCfg, err = cnConfig(); err != nil {
+		if nvCfg, err = nuverseConfig(*region); err != nil {
 			return err
 		}
-	case "jp":
-		f := os.Getenv("MOESEKAI_JP_ACCOUNT_FILE")
+	} else {
+		f := os.Getenv("MOESEKAI_" + strings.ToUpper(*region) + "_ACCOUNT_FILE")
 		if f == "" {
-			return usageError{"jp 需要 MOESEKAI_JP_ACCOUNT_FILE"}
+			return usageError{*region + " 需要 MOESEKAI_" + strings.ToUpper(*region) + "_ACCOUNT_FILE"}
 		}
 		store = sega.FileStore(f)
 	}
@@ -258,10 +270,10 @@ func cmdOnce(ctx context.Context, args []string) error {
 
 	opt := syncer.Options{Force: *force} // 单次运行不删除任何表（没有「连续两次缺失」的依据）
 	var res *syncer.Result
-	if *region == "cn" {
-		res, err = syncer.Nuverse(ctx, nuverse.New(cnCfg), b, target, opt)
+	if nuverseRegion(*region) {
+		res, err = syncer.Nuverse(ctx, nuverse.New(nvCfg), b, target, opt)
 	} else {
-		res, err = syncer.Sega(ctx, sega.New(sega.JP, b), store, *register, target, opt)
+		res, err = syncer.Sega(ctx, sega.New(sega.Configs[*region], b), store, *register, target, opt)
 	}
 	if err != nil {
 		return err
