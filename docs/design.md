@@ -298,7 +298,8 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - en：接入 `internal/sega`（配置 `sega.EN`），匿名注册同 jp，不走 CloudFront cookie。本机实测 game-version / `/api/system` 正常。
 - hmt / kr：接入 `internal/nuverse`（`HMT` / `KR`），CDN 与 serverId 实测确认，decode/还原与 Haruki 一致；kr login 实测返回空 400，**暂停，等抓包**（§5.2）。
 - `once` 和 `serve` 的区服按协议归类选配置（`sega.Configs` / `nuverse.Configs`），env 变量按区服名展开。
-- **待用户执行**：en 注册账号跑通 `once`、推 en 数据仓库；hmt/kr 等抓包分析 login，或改走 CDN 往上探。
+- en：2026-11-12 本机注册账号跑通 `once`，dataVersion 6.1.1.10 的 413 张表与 Haruki 逐字节相同，推到 `moesekai-masterdata-en`（`52f7a0b`）；账号导入集群 Secret 的 `en.json`，线上 `MOESEKAI_REGIONS=jp,cn,en`，首轮登录正常、「没有新的 master」。
+- hmt/kr 等抓包分析 login，或改走 CDN 往上探。
 
 ## 16. N4 进度（2026-11-11）
 

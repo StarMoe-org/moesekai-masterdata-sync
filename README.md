@@ -11,7 +11,7 @@ Project SEKAI 各区服 master data 的同步服务：从游戏服务器拉取�
 | 区服 | 状态 |
 | --- | --- |
 | jp | 可用（`once`；首次运行加 `--register` 注册账号） |
-| en | 已接入（CP 服，同 jp；首次 `--register`），待实测 |
+| en | 可用，线上已开启（2026-11-12；413 张表与 Haruki 逐字节相同） |
 | cn | 可用（`once`） |
 | hmt / kr | 已接入（Nuverse，同 cn），master 解码已验证；kr login 返回 400，暂停，等抓包分析 |
 

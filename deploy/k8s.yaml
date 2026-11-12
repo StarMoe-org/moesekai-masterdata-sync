@@ -79,7 +79,7 @@ spec:
             - secretRef: { name: moesekai-masterdata-sync-env }
           env:
             - name: MOESEKAI_REGIONS
-              value: jp,cn
+              value: jp,cn,en
             - name: GOMEMLIMIT          # cn 全量还原时 RSS 峰值约 1.3GB
               value: 1600MiB
           resources:
