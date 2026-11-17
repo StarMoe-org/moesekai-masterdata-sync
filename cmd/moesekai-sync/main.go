@@ -16,6 +16,7 @@ import (
 
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/ghapp"
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/ghrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/gitrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/master"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/nuverse"
@@ -150,16 +151,55 @@ func githubApp() (*ghapp.App, error) {
 	return ghapp.New(id, key)
 }
 
-// newRepo 创建数据仓库的本地副本；GitHub 地址用 App 换只针对该仓库的 token。
-func newRepo(repoURL, work string, app *ghapp.App) (*gitrepo.Repo, error) {
-	r := &gitrepo.Repo{Dir: work, URL: repoURL, Author: botIdentity}
+// repoTarget 是一个数据仓库的写入方式：GitHub 地址走 Git Data API（gh）；空仓库的首个提交和
+// 其他地址（本地裸仓库、file://）用不检出工作目录的 git（git）。
+type repoTarget struct {
+	url string
+	gh  *ghrepo.Repo // nil：不是 GitHub 地址
+	git *gitrepo.Repo
+}
+
+// newRepoTarget 创建数据仓库的写入端；GitHub 地址用 App 换只针对该仓库的 token。
+func newRepoTarget(repoURL, work string, app *ghapp.App) (*repoTarget, error) {
+	t := &repoTarget{url: repoURL, git: &gitrepo.Repo{Dir: work, URL: repoURL, Author: botIdentity}}
 	if owner, name, ok := githubRepo(repoURL); ok {
 		if app == nil {
-			return nil, usageError{"推送到 GitHub 需要 GITHUB_APP_ID 和 GITHUB_APP_PRIVATE_KEY"}
+			return nil, usageError{"写 GitHub 仓库需要 GITHUB_APP_ID 和 GITHUB_APP_PRIVATE_KEY"}
 		}
-		r.Token = func(ctx context.Context) (string, error) { return app.Token(ctx, owner, name) }
+		token := func(ctx context.Context) (string, error) { return app.Token(ctx, owner, name) }
+		t.git.Token = token
+		t.gh = &ghrepo.Repo{Owner: owner, Name: name, Token: token}
 	}
-	return r, nil
+	return t, nil
+}
+
+// Open 读数据仓库的最新状态，准备一批修改。
+func (t *repoTarget) Open(ctx context.Context) (publish.Target, error) {
+	if t.gh != nil {
+		g, err := publish.OpenGitHub(ctx, t.gh)
+		if err == nil {
+			return g, nil
+		}
+		if !errors.Is(err, ghrepo.ErrEmpty) {
+			return nil, err
+		}
+		// Git Data API 在空仓库上不可用；首个提交没有旧内容，git push 不受部分克隆的影响
+		slog.Info("数据仓库还没有提交，首个提交用 git push", "repo", t.url)
+	}
+	g, err := publish.OpenGit(ctx, t.git)
+	if err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// Tidy 在本地 git 副本超过 limit 字节时清空（只有用过 git 时才有本地副本）。
+func (t *repoTarget) Tidy(region string, limit int64) {
+	if reset, err := t.git.ResetIfLarger(limit); err != nil {
+		slog.Warn("清理本地仓库副本失败", "region", region, "err", err)
+	} else if reset {
+		slog.Info("本地仓库副本过大，已清空（下轮重新拉取目录树）", "region", region)
+	}
 }
 
 // githubRepo 从 https://github.com/<owner>/<repo>(.git) 取出 owner、repo。
@@ -259,11 +299,11 @@ func cmdOnce(ctx context.Context, args []string) error {
 		if dir == "" {
 			dir = filepath.Join(os.TempDir(), "moesekai-sync", strings.NewReplacer("/", "_", ":", "_").Replace(*repoURL))
 		}
-		r, err := newRepo(*repoURL, dir, app)
+		rt, err := newRepoTarget(*repoURL, dir, app)
 		if err != nil {
 			return err
 		}
-		if target, err = publish.OpenGit(ctx, r); err != nil {
+		if target, err = rt.Open(ctx); err != nil {
 			return err
 		}
 	}

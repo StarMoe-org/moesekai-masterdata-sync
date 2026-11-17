@@ -5,11 +5,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
 
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/alert"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/builder"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/syncer"
@@ -41,6 +43,8 @@ type Timing struct {
 	Maintenance    time.Duration // 503 后固定等待
 	AppMetaRefresh time.Duration // 正常时多久刷新一次 app-meta（兜底漏掉的回调）
 	RebuildAfter   time.Duration // 等 builder 期间多久重新请求一次（上次失败且不可重试时也会重发）
+	AlertAfter     int           // 连续失败多少轮后告警（0 表示默认 5；维护、等 builder 不算失败）
+	AlertRepeat    time.Duration // 一直失败时多久再提醒一次（0 表示默认 24 小时）
 }
 
 // DefaultTiming：设计文档 O4。
@@ -53,6 +57,8 @@ func DefaultTiming(interval time.Duration) Timing {
 		Maintenance:    5 * time.Minute,
 		AppMetaRefresh: 30 * time.Minute,
 		RebuildAfter:   6 * time.Hour,
+		AlertAfter:     5,
+		AlertRepeat:    24 * time.Hour,
 	}
 }
 
@@ -80,6 +86,8 @@ type Worker struct {
 	// Heavy 是各区服共用的锁：同一时间只有一个区服在跑一轮（下载、解码占内存）。
 	Heavy *sync.Mutex
 	Now   func() time.Time
+	// Alerts 发告警；nil 时只写日志。
+	Alerts alert.Sender
 
 	wake chan struct{}
 
@@ -93,6 +101,9 @@ type Worker struct {
 	buildRetry    bool      // 回调说可以重试：下次检查时重新请求
 	lastFailedCB  *builder.Callback
 	lastRequestID string
+	errStreak     int       // 连续出错的轮数（不含维护、等 builder）
+	errSince      time.Time // 这次连续出错从什么时候开始
+	alertedAt     time.Time // 这次连续出错上次告警的时间；零值表示还没告警
 }
 
 func (w *Worker) now() time.Time {
@@ -152,6 +163,8 @@ func (w *Worker) Notify(cb *builder.Callback) {
 			kind, msg = cb.Error.Kind, cb.Error.Message
 		}
 		slog.Error("builder 处理失败，需要人工处理", "region", w.Region, "requestId", cb.RequestID, "kind", kind, "message", msg)
+		go alert.Notify(context.Background(), w.Alerts, alert.Alert{Region: w.Region, Kind: alert.Builder,
+			Error: fmt.Sprintf("requestId %s，%s：%s", cb.RequestID, kind, msg)})
 	}
 	w.mu.Unlock()
 	w.Wake()
@@ -220,12 +233,20 @@ func (w *Worker) Step(ctx context.Context) time.Duration {
 		w.st.Rounds++
 		w.st.ConsecutiveFailures, w.st.LastError, w.backoff = 0, "", 0
 		w.st.LastSuccess = w.now()
+		var recovered *alert.Alert
+		if !w.alertedAt.IsZero() {
+			recovered = &alert.Alert{Region: w.Region, Kind: alert.Recovered, Failures: w.errStreak, Since: w.errSince}
+		}
+		w.errStreak, w.errSince, w.alertedAt = 0, time.Time{}, time.Time{}
 		w.st.DataVersion = res.DataVersion
 		if res.Updated {
 			w.st.Updates++
 			w.st.LastUpdate = w.st.LastSuccess
 		}
 		w.mu.Unlock()
+		if recovered != nil {
+			alert.Notify(ctx, w.Alerts, *recovered)
+		}
 		if res.Updated {
 			slog.Info("已更新", "region", w.Region, "dataVersion", res.DataVersion, "changed", res.Changed, "commit", res.Commit)
 		}
@@ -321,7 +342,33 @@ func (w *Worker) fail(err error) time.Duration {
 	w.record(err)
 	d := w.nextBackoff()
 	slog.Error("同步失败", "region", w.Region, "err", err, "retryIn", d.Round(time.Second))
+	if a := w.failAlert(err); a != nil {
+		alert.Notify(context.Background(), w.Alerts, *a)
+	}
 	return d
+}
+
+// failAlert 记一轮出错；连续出错达到 AlertAfter 时、以及之后每隔 AlertRepeat 返回一条告警。
+func (w *Worker) failAlert(err error) *alert.Alert {
+	now := w.now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.errStreak == 0 {
+		w.errSince = now
+	}
+	w.errStreak++
+	after, repeat := w.Timing.AlertAfter, w.Timing.AlertRepeat
+	if after <= 0 {
+		after = 5
+	}
+	if repeat <= 0 {
+		repeat = 24 * time.Hour
+	}
+	if w.errStreak < after || (!w.alertedAt.IsZero() && now.Sub(w.alertedAt) < repeat) {
+		return nil
+	}
+	w.alertedAt = now
+	return &alert.Alert{Region: w.Region, Kind: alert.Failing, Failures: w.errStreak, Since: w.errSince, Error: err.Error()}
 }
 
 // nextBackoff：MinBackoff 起翻倍，最长 MaxBackoff，带抖动。

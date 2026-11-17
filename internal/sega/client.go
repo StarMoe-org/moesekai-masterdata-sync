@@ -17,6 +17,7 @@ import (
 
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/msgpack"
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/redact"
 )
 
 // Config 是一个 CP 区服的地址和设备信息。
@@ -340,7 +341,7 @@ func (c *Client) send(ctx context.Context, method, url string, body []byte) (*ht
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, redact.URLError(err) // 地址里有 userId，不写进错误和日志
 	}
 	defer resp.Body.Close()
 	data, err := readBody(resp)

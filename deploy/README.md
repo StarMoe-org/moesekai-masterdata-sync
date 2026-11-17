@@ -1,7 +1,7 @@
 # 部署
 
 镜像：`ghcr.io/starmoe-org/moesekai-masterdata-sync`。main 分支由 `deploy.yml` 构建，标签为 12 位 commit sha 和 `main`（amd64）；`v*` 标签由 `ci.yml` 构建版本号和 `latest`（amd64 + arm64）。
-默认命令 `serve`，监听 `PORT`（默认 8080），只往 `/work`（数据仓库的本地副本）和 `/tmp` 写。
+默认命令 `serve`，监听 `PORT`（默认 8080），只往 `/work` 和 `/tmp` 写。数据仓库用 GitHub 的 Git Data API 写（设计文档 §7.1）；`/work` 只在数据仓库还是空的、首个提交用 git 推送时用到。
 
 ## 必需的 Secret（`moesekai-masterdata-sync-env`）
 
@@ -25,6 +25,7 @@
 | `ACCOUNT_SECRET_NAME` | `moesekai-masterdata-sync-accounts` | jp / en 账号所在的 Secret |
 | `MOESEKAI_JP_REGISTER` | `true` | 账号 Secret 里没有 jp / en 账号时自动注册（先写入 Secret 并读回确认，再使用）；名字沿用旧的，对 en 同样生效 |
 | `APP_META_BASE` | GitHub raw 上的 `moesekai-app-meta` | app 元数据来源 |
+| `ALERT_WEBHOOK_URL`（或 `_FILE`） | 空 | 告警 Webhook；空时只写日志（`msg=告警`）。见下面「告警」 |
 
 ## 账号
 
@@ -42,7 +43,17 @@ jp / en 账号存在 Secret `moesekai-masterdata-sync-accounts` 的 `jp.json` / 
 
 ## 出网
 
-需要能访问：`api.github.com`、`github.com`、`raw.githubusercontent.com`，jp 的 `game-version.sekai.colorfulpalette.org`、`issue.sekai.colorfulpalette.org`、`production-game-api.sekai.colorfulpalette.org`，en 的 `game-version.sekai-en.com`、`n-production-game-api.sekai-en.com`，cn 的 `mkcn-prod-public-60001-1.dailygn.com`、`lf{3,6,9,26}-mkcncdn-tos.dailygn.com`。
+需要能访问：`api.github.com`、`github.com`（只有空仓库的首个提交用 git）、`raw.githubusercontent.com`、告警 Webhook 的地址（如果配置了），jp 的 `game-version.sekai.colorfulpalette.org`、`issue.sekai.colorfulpalette.org`、`production-game-api.sekai.colorfulpalette.org`，en 的 `game-version.sekai-en.com`、`n-production-game-api.sekai-en.com`，cn 的 `mkcn-prod-public-60001-1.dailygn.com`、`lf{3,6,9,26}-mkcncdn-tos.dailygn.com`。
+
+## 告警
+
+一个区服连续出错 5 轮（维护、等 builder 不算）时告警，一直失败时每 24 小时再提醒一次，恢复时发一条；builder 回调说不可重试的失败也告警。每条告警都会写一行 `level=ERROR msg=告警`（恢复是 `level=INFO`）；配置了 `ALERT_WEBHOOK_URL` 时还会 POST：
+
+```json
+{"region":"cn","kind":"failing","failures":5,"since":"2026-11-12T12:26:02Z","error":"…","text":"[moesekai-masterdata-sync] cn 连续失败 5 轮（自 …）：…","content":"同 text"}
+```
+
+`kind` 为 `failing` / `recovered` / `builder`。`text` 和 `content` 是同一句话，Slack、Discord 一类的 Webhook 可以直接用。地址里通常带密钥，放进 `moesekai-masterdata-sync-env` Secret，不要写进 `k8s.yaml`。
 
 ## 查看状态
 

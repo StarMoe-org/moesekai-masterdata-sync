@@ -1,4 +1,4 @@
-// Package publish 是数据仓库的写入端：本地目录（调试）或 git 仓库（不检出工作目录，设计文档 §7.1）。
+// Package publish 是数据仓库的写入端：本地目录（调试）、GitHub 仓库（Git Data API）或其他 git 仓库（不检出工作目录，设计文档 §7.1）。
 package publish
 
 import (
@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/ghrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/gitrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/master"
 )
@@ -98,6 +99,53 @@ func (g *Git) Finish(ctx context.Context, message string) (string, error) {
 	for attempt := 0; ; attempt++ {
 		commit, err := g.cs.Commit(ctx, message)
 		if !errors.Is(err, gitrepo.ErrStale) || attempt >= 2 {
+			return commit, err
+		}
+		if err := g.Repo.Fetch(ctx); err != nil {
+			return "", err
+		}
+	}
+}
+
+// GitHub 用 GitHub 的 Git Data API 写数据仓库（不需要本地 git）。
+type GitHub struct {
+	Repo *ghrepo.Repo
+	cs   *ghrepo.Changeset
+}
+
+// OpenGitHub 读最新的目录树，准备一批修改。仓库还没有提交时返回 ghrepo.ErrEmpty。
+func OpenGitHub(ctx context.Context, r *ghrepo.Repo) (*GitHub, error) {
+	if err := r.Fetch(ctx); err != nil {
+		return nil, err
+	}
+	return &GitHub{Repo: r, cs: r.NewChangeset()}, nil
+}
+
+func (g *GitHub) Put(path string, data []byte) (bool, error) { return g.cs.Put(path, data) }
+
+func (g *GitHub) Current(ctx context.Context) (*master.Version, error) {
+	data, err := g.Repo.ReadFile(ctx, "versions/current_version.json")
+	if err != nil {
+		return nil, err
+	}
+	return master.ParseVersion(data)
+}
+
+func (g *GitHub) Files() []string {
+	out := make([]string, 0, len(g.Repo.Files()))
+	for p := range g.Repo.Files() {
+		out = append(out, p)
+	}
+	return out
+}
+
+func (g *GitHub) Delete(path string) { g.cs.Delete(path) }
+
+// Finish 建提交并更新分支；远端在这期间前进过就重新读取，在新的 HEAD 上重算（最多 3 次）。
+func (g *GitHub) Finish(ctx context.Context, message string) (string, error) {
+	for attempt := 0; ; attempt++ {
+		commit, err := g.cs.Commit(ctx, message)
+		if !errors.Is(err, ghrepo.ErrStale) || attempt >= 2 {
 			return commit, err
 		}
 		if err := g.Repo.Fetch(ctx); err != nil {

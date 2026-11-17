@@ -13,20 +13,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/alert"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/builder"
-	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/gitrepo"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/httpapi"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/kube"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/master"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/nuverse"
-	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/publish"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/sega"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/syncer"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/worker"
 )
 
-// workDirLimit：数据仓库本地副本超过这个大小就清空重来（emptyDir 申请 2Gi）。
+// workDirLimit：数据仓库本地 git 副本（只在空仓库的首个提交和非 GitHub 地址时使用）超过这个大小就清空重来。
 const workDirLimit = 512 << 20
 
 func env(name, def string) string {
@@ -47,6 +46,7 @@ type serveConfig struct {
 	CallbackURL string
 	HMACSecret  []byte
 	AccountName string // jp 账号 Secret
+	AlertURL    string // 告警 Webhook；空表示只写日志
 	Register    bool
 	Listen      string
 }
@@ -91,6 +91,12 @@ func loadServeConfig() (*serveConfig, error) {
 		return nil, usageError{"MOE_HMAC_SECRET（或 _FILE）至少 32 个字符，与 builder 共用"}
 	}
 	c.HMACSecret = []byte(s)
+	if c.AlertURL, err = secret("ALERT_WEBHOOK_URL"); err != nil {
+		return nil, err
+	}
+	if c.AlertURL != "" && !strings.HasPrefix(c.AlertURL, "https://") && !strings.HasPrefix(c.AlertURL, "http://") {
+		return nil, usageError{"ALERT_WEBHOOK_URL 要是 http(s) 地址"}
+	}
 	return c, nil
 }
 
@@ -108,14 +114,18 @@ func cmdServe(ctx context.Context) error {
 	if cfg.BuilderURL != "none" {
 		bc = &builder.Client{Base: cfg.BuilderURL, Callback: cfg.CallbackURL, Secret: cfg.HMACSecret}
 	}
+	var alerts alert.Sender
+	if cfg.AlertURL != "" {
+		alerts = &alert.Webhook{URL: cfg.AlertURL}
+	}
 	heavy := &sync.Mutex{}
 	workers := map[string]*worker.Worker{}
 	for _, region := range cfg.Regions {
-		r, err := newRepo(cfg.Repos[region], filepath.Join(cfg.WorkDir, region), app)
+		rt, err := newRepoTarget(cfg.Repos[region], filepath.Join(cfg.WorkDir, region), app)
 		if err != nil {
 			return err
 		}
-		runner, err := newRunner(region, cfg, r)
+		runner, err := newRunner(region, cfg, rt)
 		if err != nil {
 			return err
 		}
@@ -126,6 +136,7 @@ func cmdServe(ctx context.Context) error {
 			AppMeta: meta.Latest,
 			Builder: bc,
 			Heavy:   heavy,
+			Alerts:  alerts,
 		}
 	}
 
@@ -141,7 +152,7 @@ func cmdServe(ctx context.Context) error {
 			errc <- err
 		}
 	}()
-	slog.Info("已启动", "version", version, "listen", cfg.Listen, "regions", cfg.Regions, "builder", cfg.BuilderURL != "none")
+	slog.Info("已启动", "version", version, "listen", cfg.Listen, "regions", cfg.Regions, "builder", cfg.BuilderURL != "none", "alertWebhook", alerts != nil)
 
 	var wg sync.WaitGroup
 	for _, w := range workers {
@@ -161,16 +172,11 @@ func cmdServe(ctx context.Context) error {
 }
 
 // newRunner 为一个区服创建每轮的同步函数：每轮重新拉取数据仓库的目录树；元数据换版本时换新的客户端。
-func newRunner(region string, cfg *serveConfig, repo *gitrepo.Repo) (worker.Runner, error) {
+func newRunner(region string, cfg *serveConfig, repo *repoTarget) (worker.Runner, error) {
 	guard := master.NewDeleteGuard()
 	after := func(res *syncer.Result) {
-		if res == nil || res.Commit == "" {
-			return
-		}
-		if reset, err := repo.ResetIfLarger(workDirLimit); err != nil {
-			slog.Warn("清理本地仓库副本失败", "region", region, "err", err)
-		} else if reset {
-			slog.Info("本地仓库副本过大，已清空（下轮重新拉取目录树）", "region", region)
+		if res != nil && res.Commit != "" {
+			repo.Tidy(region, workDirLimit)
 		}
 	}
 	if nuverseRegion(region) {
@@ -183,7 +189,7 @@ func newRunner(region string, cfg *serveConfig, repo *gitrepo.Repo) (worker.Runn
 		}
 		client := nuverse.New(ncfg)
 		return worker.RunnerFunc(func(ctx context.Context, b *appmeta.Bundle) (*syncer.Result, error) {
-			t, err := publish.OpenGit(ctx, repo)
+			t, err := repo.Open(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -210,7 +216,7 @@ func newRunner(region string, cfg *serveConfig, repo *gitrepo.Repo) (worker.Runn
 		if client == nil || client.Bundle != b {
 			client = sega.New(segaCfg, b) // 新版本：重新查 game-version、拿 cookie
 		}
-		t, err := publish.OpenGit(ctx, repo)
+		t, err := repo.Open(ctx)
 		if err != nil {
 			return nil, err
 		}

@@ -195,17 +195,24 @@ versions/current_version.json
 
 ### 7.1 写仓库（不检出工作目录）
 
-cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB），但每次更新通常只改几个文件（185→186 改了 4 个，diff 压缩后约 70 KB）。所以不检出工作目录：
+cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB），但每次更新通常只改几个文件（185→186 改了 4 个，diff 压缩后约 70 KB）。所以不检出工作目录，也不在本地保留文件内容。
 
-1. 第一次运行时 `git init --bare`，配成部分克隆（`extensions.partialClone=origin`、`remote.origin.partialCloneFilter=blob:none`），之后每轮 `git fetch --filter=blob:none --depth=1`，只拿提交和目录树；`git ls-tree -r -z` 得到每个文件的 blob 哈希。远端还没有分支（空仓库）时从空树开始。
-2. 每张表生成 JSON 后立即算 git blob 哈希（`sha1("blob <长度>\0" + 内容)`），和树里的比较；相同就丢掉，不同才由 Go 直接写成松散对象（zlib）。表生成完就释放，不在内存里攒整份 master。
-3. Go 按「路径 → 对象名」自己写出树对象（只有变化的子树产生新对象），`git commit-tree` 生成提交，`git push --no-thin`；被拒（非快进）时重新 fetch，在新的 HEAD 上重算（只读树，不需要合并），最多 3 次。如果某个文件当初因「没变」没写对象、而远端在这期间改了它，直接报错，下一轮重新生成。
+**GitHub 仓库（线上）：用 Git Data API（`internal/ghrepo`，2026-11-17 起）。**
+
+1. 每轮 `GET git/ref/heads/main`；提交变了才 `GET git/commits/{sha}` 和 `GET git/trees/{tree}?recursive=1`，得到每个文件的 blob 哈希（列表被截断时报错）。
+2. 每张表生成 JSON 后立即算 git blob 哈希（`sha1("blob <长度>\0" + 内容)`），和树里的比较；相同就丢掉。不同的内容攒成一批（≤ 8 MB、≤ 200 个文件），用一个 `POST git/trees`（条目带内联 `content`、按序号命名、不带 base_tree）让 GitHub 写出这些 blob；非 UTF-8 或单个超过 8 MB 的文件走 `POST git/blobs`（base64）。GitHub 返回的每个对象名都要和本地算出的一致，否则报错、不提交。远端树里已有的对象不重复上传。
+3. 最后一个 `POST git/trees`（`base_tree` = 当前树，条目只写变化的路径和对象名，删除写 `sha: null`）→ `POST git/commits`（不填作者，GitHub 用 App 身份 `moesekai-bot[bot]` 并签名）→ `PATCH git/refs/heads/main`（`force: false`）。不是快进（422）时重新读分支，在新的 HEAD 上重算，最多 3 次；当初因「没变」没上传的内容一定在旧树里，GitHub 上已有，不需要重新生成。
 4. 删除保护（§7）按「这次没有、树里有」的文件计算。
-5. 读 `versions/current_version.json` 是唯一按需下载 blob 的地方（只下这一个对象）；其余 git 命令都带 `GIT_NO_LAZY_FETCH=1`，任何意外需要旧内容的操作会直接失败，而不是悄悄下载整份数据。
-6. 推送必须 `--no-thin`：thin pack 会拿远端已有的旧内容做差量基准，需要读本地没有的旧 blob。
-7. token 只通过 `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` 环境变量传 `http.extraHeader`，不出现在命令行参数和 `.git/config` 里。
+5. `versions/current_version.json` 用 `GET git/blobs/{sha}` 读，按对象名缓存。
+6. 请求数：没有新 master 时每轮 1 个（只查分支）；一次更新约「批数 + 3」个。不按文件逐个创建 blob，避开 GitHub 对创建内容的频率限制。
 
-效果：磁盘只放 git 对象（几 MB），内存峰值只剩一份解码后的 master，O9 一并解决。
+**空仓库和非 GitHub 地址（本地裸仓库、file://）：仍用 git（`internal/gitrepo`）。** Git Data API 在空仓库上不可用，首个提交用 git 推送（没有旧内容，不受下面的问题影响）：
+
+1. `git init --bare`，配成部分克隆（`blob:none`），`git fetch --filter=blob:none --depth=1` 只拿提交和目录树；Go 直接写松散对象和树对象，`git commit-tree`，`git push`。
+2. 全程 `GIT_NO_LAZY_FETCH=1`（读版本文件时除外）；token 只通过 `GIT_CONFIG_*` 环境变量传 `http.extraHeader`。
+3. **已知问题（2026-11-17 定位）**：HTTPS 推送时 git 忽略 `--no-thin`（`git-remote-https` 总是让 send-pack 带 `--thin`），打包要读改动文件的旧内容做差量基准，部分克隆本地没有，推送失败（`could not fetch … from promisor remote`）。`file://` 远端会照 `--no-thin` 执行，所以单测没有发现。因此 GitHub 仓库的增量提交一律走 API，git 只用于空仓库的首个提交和本地仓库。
+
+效果：内存峰值只剩一份解码后的 master 加一批待上传的内容（≤ 8 MB），O9 一并解决。
 
 ## 8. 状态
 
@@ -311,4 +318,13 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 - JP2 首次部署（ssh + `kubectl create`）：账号 Secret 先写入本机已注册的 jp 账号，再建变量 Secret 和其余对象。cn 第一轮即正常（判为没有新 master）；jp 因 game-version 403 失败，按上一条修复。
 - 修复（`720597c`）推送后由 Ferry 自动更新到 `720597ceacb2`：jp 回退到默认域名后登录正常，jp、cn 都判为没有新 master，`/healthz` 两个区服都没有失败；空闲时内存约 9Mi。账号 Secret 里的 jp 账号直接使用，没有重新注册。
 - 还没有在线上经历过真实的新 master 和版本过期；builder 的主动发现与 `SYNC_CALLBACK_URL`（builder M6）尚未实现，目前只有本服务发起的请求会收到回调。
+
+## 18. cn 187 推送失败与修复（2026-11-17）
+
+- 现象：2026-11-12 12:25 UTC cn 出了 187（dataVersion 6.4.1.7，36 张表变化），这是线上第一次增量提交；`git push` 连续失败 222 轮（`could not fetch 1760d1ee… from promisor remote`，缺的是 `master/avatarAccessories.json` 的旧内容），数据仓库停在 186。jp / en 一直没有新 master，未受影响，但第一次更新时会同样失败。服务没有告警，5 天后看日志才发现。
+- 根因：见 §7.1「已知问题」。用 git 2.49.1（线上版本）和本地 `git http-backend` 复现：HTTP 推送报同样的错，`file://` 推送成功；`GIT_TRACE` 显示 send-pack 带 `--thin`。git 2.54 相同。
+- 修复：GitHub 仓库改用 Git Data API 写（§7.1，`internal/ghrepo`，模拟 API 的单测覆盖提交、分批、非 UTF-8、删除、非快进重算、对象名不一致、空仓库）。
+- 同时修的：
+  - **uid 写进了日志**：cn login 网络出错（TLS 握手超时）时，Go 的错误信息带完整地址，地址里有 uid（违反 O6）。`internal/redact` 把 `*url.Error` 里的 `/user/<id>` 换成 `/user/…`，cn login 和 jp / en 的请求都用上。
+  - **告警**：`internal/alert`。一个区服连续出错 5 轮（维护、等 builder 不算）时告警，一直失败每 24 小时再提醒一次，恢复时发一条；builder 回调不可重试的失败也告警。总会写一条 `msg=告警` 的日志；配置了 `ALERT_WEBHOOK_URL` 时 POST JSON（同时带 `text` 和 `content` 字段，兼容 Slack / Discord 一类的 Webhook）。StarMoe 目前没有统一的告警渠道（starmoe-docs「可观测性」），Webhook 地址待定。
 

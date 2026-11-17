@@ -16,6 +16,7 @@ import (
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/crypto"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/msgpack"
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/redact"
 )
 
 // Config 是一个 Nuverse 区服的地址。
@@ -134,7 +135,7 @@ func (c *Client) Login(ctx context.Context, b *appmeta.Bundle) (*Status, error) 
 	defer cancel()
 	resp, err := c.HTTP.Do(req.WithContext(ctx2))
 	if err != nil {
-		return nil, fmt.Errorf("login：%w", err)
+		return nil, fmt.Errorf("login：%w", redact.URLError(err)) // 地址里有 uid，不写进日志
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))

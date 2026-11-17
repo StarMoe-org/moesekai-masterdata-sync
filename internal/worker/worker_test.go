@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/alert"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/builder"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/syncer"
@@ -194,5 +195,78 @@ func TestStartupAppMetaFailure(t *testing.T) {
 	w.Builder = nil
 	if d := w.Step(context.Background()); d != time.Minute {
 		t.Errorf("启动时读不到 app-meta 应退避：%v", d)
+	}
+}
+
+type fakeAlerts struct{ got []alert.Alert }
+
+func (f *fakeAlerts) Send(_ context.Context, a alert.Alert) error {
+	f.got = append(f.got, a)
+	return nil
+}
+
+func TestAlerts(t *testing.T) {
+	ctx := context.Background()
+	var err error
+	w, now := newWorker(&fakeMeta{version: "7.1.0"}, &fakeBuilder{}, func(*appmeta.Bundle) (*syncer.Result, error) {
+		if err != nil {
+			return nil, err
+		}
+		return &syncer.Result{DataVersion: "1"}, nil
+	})
+	fa := &fakeAlerts{}
+	w.Alerts = fa
+	step := func() { *now = now.Add(w.Step(ctx)) }
+
+	// 维护不算出错
+	err = fmt.Errorf("x：%w", syncer.ErrMaintenance)
+	for range 6 {
+		step()
+	}
+	if len(fa.got) != 0 {
+		t.Fatalf("维护期间告警了：%v", fa.got)
+	}
+
+	err = errors.New("git push：exit status 1")
+	start := *now
+	for range 4 {
+		step()
+	}
+	if len(fa.got) != 0 {
+		t.Fatalf("不到 5 轮就告警了：%v", fa.got)
+	}
+	step()
+	if len(fa.got) != 1 || fa.got[0].Kind != alert.Failing || fa.got[0].Failures != 5 || !fa.got[0].Since.Equal(start) || fa.got[0].Error != err.Error() {
+		t.Fatalf("第 5 轮的告警 = %+v", fa.got)
+	}
+	for range 3 { // 一直失败：24 小时内不重复
+		step()
+	}
+	if len(fa.got) != 1 {
+		t.Fatalf("重复告警：%v", fa.got)
+	}
+	*now = now.Add(24 * time.Hour)
+	step()
+	if len(fa.got) != 2 || fa.got[1].Failures != 9 {
+		t.Fatalf("24 小时后应再提醒一次：%+v", fa.got)
+	}
+
+	err = nil
+	step()
+	if len(fa.got) != 3 || fa.got[2].Kind != alert.Recovered || fa.got[2].Failures != 9 {
+		t.Fatalf("恢复告警 = %+v", fa.got)
+	}
+	step()
+	if len(fa.got) != 3 {
+		t.Fatalf("恢复后又告警：%v", fa.got)
+	}
+
+	// 没告警过的短暂失败，恢复时不发
+	err = errors.New("TLS handshake timeout")
+	step()
+	err = nil
+	step()
+	if len(fa.got) != 3 {
+		t.Fatalf("短暂失败恢复时发了告警：%v", fa.got)
 	}
 }
