@@ -109,9 +109,15 @@ type Client struct {
 	profile   string
 	hostHash  string
 	cookie    string
+	cookieAt  time.Time // 拿到 cookie 的时间
 	installID string
 	session   *Session
 }
+
+// cookieMaxAge：CloudFront 签名 cookie 用多久就主动换新的。signature 发的 policy 有效期是 24 小时
+// （2026-11-19 JP2 实测 DateLessThan = 发放时间 + 24h）；登录不校验 cookie，过期后只有下载分片会 403，
+// 所以不能只靠登录的 403 来发现过期。
+const cookieMaxAge = 6 * time.Hour
 
 // New 创建客户端；b 提供 appVersion、appHash、Unity 版本和密钥。
 func New(cfg Config, b *appmeta.Bundle) *Client {
@@ -176,7 +182,22 @@ func (c *Client) refreshCookie(ctx context.Context) error {
 		return errors.New("sega: signature 没有返回 CloudFront cookie")
 	}
 	c.cookie = strings.Join(parts, "; ")
+	c.cookieAt = time.Now()
 	return nil
+}
+
+// ensureCookie 在 cookie 用了超过 cookieMaxAge 时换新的。
+func (c *Client) ensureCookie(ctx context.Context) error {
+	if c.Config.IssueBase == "" || (c.cookie != "" && time.Since(c.cookieAt) < cookieMaxAge) {
+		return nil
+	}
+	return c.refreshCookie(ctx)
+}
+
+// isForbidden：CloudFront cookie 过期或无效时的响应。
+func isForbidden(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && (he.Status == http.StatusForbidden || he.Status == http.StatusUnauthorized)
 }
 
 // Register 注册一个新账号。调用方必须先把结果存好再使用（设计文档 §5.1）。
@@ -211,6 +232,9 @@ func (c *Client) Login(ctx context.Context, a *Account) (*Session, error) {
 		c.installID = newUUID()
 	}
 	c.session = nil
+	if err := c.ensureCookie(ctx); err != nil {
+		return nil, err
+	}
 	url := fmt.Sprintf("%s/api/user/%d/auth?refreshUpdatedResources=False", c.apiBase, a.UserID)
 	body := msgpack.M("credential", a.Credential, "deviceId", nil, "authTriggerType", "normal")
 	var s *Session
@@ -233,13 +257,13 @@ func (c *Client) Login(ctx context.Context, a *Account) (*Session, error) {
 		}
 	}
 	err := c.call(ctx, http.MethodPut, url, body, parse)
-	var he *HTTPError
-	if errors.As(err, &he) && (he.Status == http.StatusForbidden || he.Status == http.StatusUnauthorized) {
+	if isForbidden(err) {
 		if err := c.refreshCookie(ctx); err != nil {
 			return nil, err
 		}
 		err = c.call(ctx, http.MethodPut, url, body, parse)
-		if errors.As(err, &he) && (he.Status == http.StatusForbidden || he.Status == http.StatusUnauthorized) {
+		var he *HTTPError
+		if errors.As(err, &he) && isForbidden(err) {
 			return nil, fmt.Errorf("%w（HTTP %d）", ErrAccount, he.Status)
 		}
 	}
@@ -266,7 +290,18 @@ func (c *Client) Master(ctx context.Context, fn func(split *msgpack.Map) error) 
 			return fmt.Errorf("sega: 分片路径 %q 不合法", p)
 		}
 		var split *msgpack.Map
-		if err := c.call(ctx, http.MethodGet, c.apiBase+"/api/"+p, nil, func(v *msgpack.Map) { split = v }); err != nil {
+		fetch := func() error {
+			return c.call(ctx, http.MethodGet, c.apiBase+"/api/"+p, nil, func(v *msgpack.Map) { split = v })
+		}
+		err := fetch()
+		if isForbidden(err) && c.Config.IssueBase != "" {
+			// 分片走 CloudFront，cookie 过期时 403（登录不校验 cookie，发现不了）：换新 cookie 再试一次
+			slog.Warn("下载分片被拒，重新获取 cookie", "region", c.Config.Region, "split", p)
+			if err = c.refreshCookie(ctx); err == nil {
+				err = fetch()
+			}
+		}
+		if err != nil {
 			return fmt.Errorf("分片 %s：%w", p, err)
 		}
 		if err := fn(split); err != nil {

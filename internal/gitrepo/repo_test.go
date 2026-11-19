@@ -241,3 +241,35 @@ func TestResetIfLarger(t *testing.T) {
 		t.Errorf("第二次应读缓存：%v", err)
 	}
 }
+
+func TestPushBlobs(t *testing.T) {
+	ctx := context.Background()
+	url, remote := newRemote(t)
+	r := newRepo(t, url)
+	cs := r.NewChangeset()
+	put(t, cs, "a.json", "[1]\n")
+	head, err := cs.Commit(ctx, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	up := &Repo{Dir: filepath.Join(t.TempDir(), "upload"), URL: url, Author: Identity{"bot", "bot@example.com"}}
+	big := strings.Repeat("大文件", 1000)
+	for range 2 { // 第二次覆盖同一个 ref（--force）
+		if _, err := up.PushBlobs(ctx, "refs/heads/tmp/x", []byte(big), []byte("[2]\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := run(t, remote, "cat-file", "-p", BlobHash([]byte(big))); got != big {
+		t.Fatalf("远端的大文件内容不对（%d 字节）", len(got))
+	}
+	if got := strings.TrimSpace(run(t, remote, "rev-parse", "refs/heads/main")); got != head {
+		t.Fatalf("main 被改动：%s ≠ %s", got, head)
+	}
+	if _, err := os.Stat(up.Dir); !os.IsNotExist(err) {
+		t.Fatalf("推送后本地目录应删除：%v", err)
+	}
+	if _, err := up.PushBlobs(ctx, "tmp/x", []byte(big)); err == nil {
+		t.Fatal("不完整的 ref 应报错")
+	}
+}

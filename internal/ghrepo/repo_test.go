@@ -20,19 +20,20 @@ import (
 
 // fakeGitHub 是 Git Data API 的最小模拟：树按「完整路径 → 条目」扁平存放。
 type fakeGitHub struct {
-	mu      sync.Mutex
-	blobs   map[string][]byte
-	trees   map[string]map[string]Entry
-	commits map[string][2]string // sha → {tree, parent}
-	ref     string
-	calls   map[string]int // "METHOD 路径前缀" → 次数
-	corrupt bool           // 上传后返回错误的对象名
-	n       int
+	mu       sync.Mutex
+	blobs    map[string][]byte
+	trees    map[string]map[string]Entry
+	commits  map[string][2]string // sha → {tree, parent}
+	ref      string
+	branches map[string]bool // 其他分支（只记名字）
+	calls    map[string]int  // "METHOD 路径前缀" → 次数
+	corrupt  bool            // 上传后返回错误的对象名
+	n        int
 }
 
 func newFake() *fakeGitHub {
 	return &fakeGitHub{blobs: map[string][]byte{}, trees: map[string]map[string]Entry{},
-		commits: map[string][2]string{}, calls: map[string]int{}}
+		commits: map[string][2]string{}, calls: map[string]int{}, branches: map[string]bool{}}
 }
 
 func (f *fakeGitHub) addBlob(data []byte) string {
@@ -219,6 +220,23 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 201, map[string]string{"sha": f.addCommit(in.Tree, in.Parents[0])})
+	case r.Method == "GET" && parts[1] == "matching-refs":
+		prefix := strings.TrimPrefix(parts[2], "heads/")
+		list := []map[string]string{}
+		for b := range f.branches {
+			if strings.HasPrefix(b, prefix) {
+				list = append(list, map[string]string{"ref": "refs/heads/" + b})
+			}
+		}
+		writeJSON(w, 200, list)
+	case r.Method == "DELETE" && strings.HasPrefix(path, "git/refs/heads/"):
+		b := strings.TrimPrefix(path, "git/refs/heads/")
+		if !f.branches[b] {
+			fail(422, "Reference does not exist")
+			return
+		}
+		delete(f.branches, b)
+		w.WriteHeader(204)
 	case r.Method == "PATCH" && path == "git/refs/heads/main":
 		var in struct {
 			SHA   string `json:"sha"`
@@ -402,5 +420,80 @@ func TestEmptyAndCorrupt(t *testing.T) {
 	}
 	if got := f.content()["a"]; got != "1" {
 		t.Fatalf("出错后远端被改成了 %q", got)
+	}
+}
+
+// 大文件交给 PushBlob 推到临时分支，提交后删掉；ErrStale 重试期间保留。
+func TestLargeViaPush(t *testing.T) {
+	ctx := context.Background()
+	f, r := setup(t)
+	f.seed(map[string]string{"a": "1"})
+	r.LargeBytes = 10
+	var pushed []string
+	r.PushBlob = func(_ context.Context, ref string, data []byte) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		b, ok := strings.CutPrefix(ref, "refs/heads/")
+		if !ok {
+			t.Errorf("ref %q", ref)
+		}
+		f.addBlob(data)
+		f.branches[b] = true
+		pushed = append(pushed, b)
+		return nil
+	}
+	if err := r.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs := r.NewChangeset()
+	big := "0123456789abcdef"
+	mustPut(t, cs, "big.json", big)
+	mustPut(t, cs, "a", "2")
+	f.seed(map[string]string{"c": "3"}) // 远端前进：第一次 Commit 被拒
+	if _, err := cs.Commit(ctx, "x"); !errors.Is(err, ErrStale) {
+		t.Fatalf("Commit = %v，应为 ErrStale", err)
+	}
+	if len(f.branches) != 1 {
+		t.Fatalf("ErrStale 后临时分支应保留：%v", f.branches)
+	}
+	if err := r.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.Commit(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"a": "2", "big.json": big, "c": "3"}
+	if got := f.content(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("远端内容\n got %v\nwant %v", got, want)
+	}
+	if len(pushed) != 1 || !strings.HasPrefix(pushed[0], TempBranchPrefix) || len(f.branches) != 0 {
+		t.Fatalf("推送 %v，剩余分支 %v", pushed, f.branches)
+	}
+	if f.calls["POST git/blobs"] != 0 {
+		t.Fatalf("大文件不应走 POST git/blobs：%v", f.calls)
+	}
+
+	// 遗留的临时分支：CleanupTemp 只删前缀匹配的
+	f.branches[TempBranchPrefix+"old"], f.branches["dev"] = true, true
+	if err := r.CleanupTemp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(f.branches) != "map[dev:true]" {
+		t.Fatalf("CleanupTemp 后剩余 %v", f.branches)
+	}
+
+	// 提交出错也删临时分支
+	f.corrupt = true
+	if err := r.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs = r.NewChangeset()
+	mustPut(t, cs, "big.json", big+"!")
+	mustPut(t, cs, "a", "4")
+	if _, err := cs.Commit(ctx, "y"); err == nil {
+		t.Fatal("对象名不一致时 Commit 应报错")
+	}
+	if fmt.Sprint(f.branches) != "map[dev:true]" {
+		t.Fatalf("出错后临时分支没删：%v", f.branches)
 	}
 }

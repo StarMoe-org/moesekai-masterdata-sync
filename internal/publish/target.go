@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,9 +115,15 @@ type GitHub struct {
 }
 
 // OpenGitHub 读最新的目录树，准备一批修改。仓库还没有提交时返回 ghrepo.ErrEmpty。
+// 先删掉上一轮没清理的大文件临时分支（失败只记日志）。
 func OpenGitHub(ctx context.Context, r *ghrepo.Repo) (*GitHub, error) {
 	if err := r.Fetch(ctx); err != nil {
 		return nil, err
+	}
+	if r.PushBlob != nil {
+		if err := r.CleanupTemp(ctx); err != nil {
+			slog.Warn("清理遗留的临时分支失败", "repo", r.Owner+"/"+r.Name, "err", err)
+		}
 	}
 	return &GitHub{Repo: r, cs: r.NewChangeset()}, nil
 }
@@ -146,6 +153,9 @@ func (g *GitHub) Finish(ctx context.Context, message string) (string, error) {
 	for attempt := 0; ; attempt++ {
 		commit, err := g.cs.Commit(ctx, message)
 		if !errors.Is(err, ghrepo.ErrStale) || attempt >= 2 {
+			if errors.Is(err, ghrepo.ErrStale) {
+				_ = g.cs.Cleanup(ctx) // 放弃重试：临时分支不再需要（删不掉的下轮 OpenGitHub 再删）
+			}
 			return commit, err
 		}
 		if err := g.Repo.Fetch(ctx); err != nil {

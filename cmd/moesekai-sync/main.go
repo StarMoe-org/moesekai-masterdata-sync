@@ -169,6 +169,12 @@ func newRepoTarget(repoURL, work string, app *ghapp.App) (*repoTarget, error) {
 		token := func(ctx context.Context) (string, error) { return app.Token(ctx, owner, name) }
 		t.git.Token = token
 		t.gh = &ghrepo.Repo{Owner: owner, Name: name, Token: token}
+		// Git Data API 收不下的大文件用 git 推到临时分支（本地目录只在推送期间存在）
+		uploader := &gitrepo.Repo{Dir: work + "-upload", URL: repoURL, Token: token, Author: botIdentity}
+		t.gh.PushBlob = func(ctx context.Context, ref string, data []byte) error {
+			_, err := uploader.PushBlobs(ctx, ref, data)
+			return err
+		}
 	}
 	return t, nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/appmeta"
 	"github.com/StarMoe-org/moesekai-masterdata-sync/internal/crypto"
@@ -31,10 +32,12 @@ type fakeServer struct {
 	t           *testing.T
 	srv         *httptest.Server
 	key         crypto.Key
-	forbidFirst int  // 登录先返回几次 403
-	noCookie    bool // true 时不要求 CloudFront cookie（模拟 en）
-	status      int  // 非 0 时登录直接返回这个状态码
-	cookieOK    bool // 已发过 cookie
+	forbidFirst int    // 登录先返回几次 403
+	noCookie    bool   // true 时不要求 CloudFront cookie（模拟 en）
+	status      int    // 非 0 时登录直接返回这个状态码
+	cookieOK    bool   // 已发过 cookie
+	policy      string // signature 发出、且被接受的 CloudFront-Policy（空表示 "p"）
+	signatures  int
 	logins      int
 	splitHits   []string
 	sessionSeen []string
@@ -78,11 +81,12 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/7.1.0/hash":
 		f.reply(w, msgpack.M("profile", "production", "assetbundleHostHash", "cf", "domain", host))
 	case r.URL.Path == "/api/signature":
-		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Policy", Value: "p"})
+		f.signatures++
+		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Policy", Value: f.currentPolicy()})
 		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Signature", Value: "s"})
 		http.SetCookie(w, &http.Cookie{Name: "CloudFront-Key-Pair-Id", Value: "k"})
 		w.Write([]byte("{}\n"))
-	case !f.noCookie && h.Get("Cookie") != "CloudFront-Policy=p; CloudFront-Signature=s; CloudFront-Key-Pair-Id=k":
+	case !f.noCookie && h.Get("Cookie") != "CloudFront-Policy="+f.currentPolicy()+"; CloudFront-Signature=s; CloudFront-Key-Pair-Id=k":
 		w.WriteHeader(http.StatusForbidden)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/user":
 		b := f.body(r)
@@ -128,6 +132,13 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (f *fakeServer) currentPolicy() string {
+	if f.policy == "" {
+		return "p"
+	}
+	return f.policy
 }
 
 func (f *fakeServer) client() *Client {
@@ -273,5 +284,59 @@ func TestGameVersionFallback(t *testing.T) {
 	c.HTTP = f.srv.Client()
 	if err := c.Prepare(ctx); err == nil {
 		t.Error("没有默认域名时应报错")
+	}
+}
+
+// cookie 过期（2026-11-19 JP2：签名 24 小时后失效，登录仍成功、分片 403）：下载分片时换新 cookie 再试。
+func TestSplitCookieExpired(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(t)
+	c := f.client()
+	if err := c.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Login(ctx, &Account{UserID: 1234, Credential: "cred", InstallID: "i"}); err != nil {
+		t.Fatal(err)
+	}
+	f.policy = "p2" // 旧 cookie 失效
+	var n int
+	if err := c.Master(ctx, func(*msgpack.Map) error { n++; return nil }); err != nil {
+		t.Fatalf("Master = %v", err)
+	}
+	if n != 2 || f.signatures != 2 {
+		t.Fatalf("分片 %d 个、signature %d 次；应为 2、2", n, f.signatures)
+	}
+
+	// 换了 cookie 仍然 403：报错，不无限重试
+	f.policy = "p3"
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/suitemasterfile/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		f.handle(w, r)
+	})
+	err := c.Master(ctx, func(*msgpack.Map) error { return nil })
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusForbidden || f.signatures != 3 {
+		t.Fatalf("一直 403 时 Master = %v（signature %d 次）", err, f.signatures)
+	}
+}
+
+// cookie 用久了，登录前主动换新的（不等分片 403）。
+func TestCookieRefreshedByAge(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(t)
+	c := f.client()
+	if err := c.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a := &Account{UserID: 1234, Credential: "cred", InstallID: "i"}
+	if _, err := c.Login(ctx, a); err != nil || f.signatures != 1 {
+		t.Fatalf("新 cookie 不应重新获取：%v，signature %d 次", err, f.signatures)
+	}
+	c.cookieAt = time.Now().Add(-cookieMaxAge - time.Minute)
+	if _, err := c.Login(ctx, a); err != nil || f.signatures != 2 {
+		t.Fatalf("旧 cookie 应在登录前换新：%v，signature %d 次", err, f.signatures)
 	}
 }
