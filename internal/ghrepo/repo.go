@@ -3,6 +3,7 @@
 //   - 读：分支 → 提交 → 递归目录树，得到每个文件的 blob 对象名；只按需读小文件（版本文件）。
 //   - 写：内容有变化的文件攒成一批，用 POST git/trees 的内联内容一次上传（每批一个请求，
 //     不按文件逐个请求，避开 GitHub 对创建内容的频率限制）；非 UTF-8 或单个过大的文件走 POST git/blobs。
+//     超过 LargeBytes 的文件 API 收不下（HTTP 422），交给 PushBlob 用 git 推到临时分支，提交后删掉临时分支。
 //     每个上传的对象名都和本地算出的比对。最后在当前树上建新树、建提交、以快进方式更新分支。
 //
 // 早先用 `git push` 推送部分克隆（blob:none）的本地副本：HTTPS 推送时 git 忽略 --no-thin，
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -38,6 +40,11 @@ const (
 	defaultBatchBytes = 8 << 20 // 一批内联上传的内容上限
 	maxBatchFiles     = 200     // 一批最多几个文件
 	smallFileLimit    = 64 << 10
+	// defaultLargeBytes：超过这个大小的文件不走 POST git/blobs。2026-11-19 实测 51,116,009 字节
+	// （base64 后约 68MB）返回 422 "input was too large"；35MB 的 cards.json 之前能传。
+	defaultLargeBytes = 32 << 20
+	// TempBranchPrefix：大文件临时分支的前缀（refs/heads/ 之后），发布完成后删除。
+	TempBranchPrefix = "moesekai-sync/upload-"
 )
 
 // Entry 是树里的一个条目（含子模块等非 blob 条目，原样保留）。
@@ -56,6 +63,11 @@ type Repo struct {
 	Token func(ctx context.Context) (string, error)
 	// BatchBytes 是一批内联上传的内容上限（默认 8MB）。
 	BatchBytes int
+	// PushBlob 把 data 推到远端的 ref（refs/heads/…）上，让 GitHub 有这个 blob；用于超过 LargeBytes 的文件。
+	// 为 nil 时大文件仍走 POST git/blobs。
+	PushBlob func(ctx context.Context, ref string, data []byte) error
+	// LargeBytes 是走 PushBlob 的文件大小下限（默认 32MB）。
+	LargeBytes int
 
 	head   string           // 分支当前的提交；Fetch 之后非空
 	tree   string           // head 的根树
@@ -181,6 +193,7 @@ type Changeset struct {
 	pending  []pendingBlob
 	pendSize int
 	changed  int
+	temps    []string // 推大文件用的临时分支（refs/heads/ 之后的部分）
 }
 
 type pendingBlob struct {
@@ -204,6 +217,15 @@ func (c *Changeset) Put(path string, data []byte) (bool, error) {
 	}
 	c.changed++
 	if c.uploaded[sha] || c.repo.hashes[sha] || c.isPending(sha) {
+		return true, nil
+	}
+	if len(data) > c.repo.largeBytes() && c.repo.PushBlob != nil {
+		branch := TempBranchPrefix + sha[:12]
+		if err := c.repo.PushBlob(ctx, "refs/heads/"+branch, data); err != nil {
+			return false, fmt.Errorf("推送 %s（%d 字节）：%w", path, len(data), err)
+		}
+		c.temps = append(c.temps, branch)
+		c.uploaded[sha] = true
 		return true, nil
 	}
 	if !utf8.Valid(data) || len(data) > c.repo.batchBytes() {
@@ -299,6 +321,53 @@ func (r *Repo) uploadBlob(ctx context.Context, sha string, data []byte) error {
 	return nil
 }
 
+func (r *Repo) largeBytes() int {
+	if r.LargeBytes > 0 {
+		return r.LargeBytes
+	}
+	return defaultLargeBytes
+}
+
+// Cleanup 删掉这批修改推大文件用的临时分支。Commit 成功或出错（ErrStale 除外，调用方还会重试）后自动调用；
+// 不再 Commit 时由调用方调用。删除失败只返回错误，不影响已经完成的提交。
+func (c *Changeset) Cleanup(ctx context.Context) error {
+	err := c.repo.deleteBranches(ctx, c.temps)
+	c.temps = nil
+	return err
+}
+
+// CleanupTemp 删掉远端所有遗留的临时分支（上一轮推了大文件、但没走到 Commit 就失败了）。
+func (r *Repo) CleanupTemp(ctx context.Context) error {
+	var refs []struct {
+		Ref string `json:"ref"`
+	}
+	if err := r.call(ctx, http.MethodGet, "git/matching-refs/heads/"+TempBranchPrefix, nil, &refs); err != nil {
+		return err
+	}
+	var branches []string
+	for _, x := range refs {
+		if b, ok := strings.CutPrefix(x.Ref, "refs/heads/"); ok && strings.HasPrefix(b, TempBranchPrefix) {
+			branches = append(branches, b)
+		}
+	}
+	return r.deleteBranches(ctx, branches)
+}
+
+func (r *Repo) deleteBranches(ctx context.Context, branches []string) error {
+	var errs []error
+	for _, b := range branches {
+		err := r.call(ctx, http.MethodDelete, "git/refs/heads/"+b, nil, nil)
+		var he *HTTPError
+		if errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusUnprocessableEntity) {
+			err = nil // 已经不在了
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("删除临时分支 %s：%w", b, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (r *Repo) batchBytes() int {
 	if r.BatchBytes > 0 {
 		return r.BatchBytes
@@ -307,7 +376,24 @@ func (r *Repo) batchBytes() int {
 }
 
 // Commit 在当前 head 上应用修改、建提交并快进更新分支。没有任何变化时返回空串。
-func (c *Changeset) Commit(ctx context.Context, message string) (string, error) {
+// 除 ErrStale（调用方会 Fetch 后重试）外，返回前删掉推大文件用的临时分支。
+func (c *Changeset) Commit(ctx context.Context, message string) (sha string, err error) {
+	defer func() {
+		if errors.Is(err, ErrStale) {
+			return
+		}
+		if cerr := c.Cleanup(ctx); cerr != nil {
+			if err == nil {
+				slog.Warn("提交已完成，但临时分支没删掉", "repo", c.repo.Owner+"/"+c.repo.Name, "err", cerr)
+			} else {
+				err = errors.Join(err, cerr)
+			}
+		}
+	}()
+	return c.commit(ctx, message)
+}
+
+func (c *Changeset) commit(ctx context.Context, message string) (string, error) {
 	r := c.repo
 	if r.head == "" {
 		return "", ErrEmpty

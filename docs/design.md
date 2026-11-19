@@ -111,8 +111,9 @@ GET  https://{domain}/api/{suiteMasterSplitPath[i]}            → 逐个分片�
 ```
 
 - 请求头：`X-App-Version`、`X-App-Hash`、`X-Data-Version`、`X-Asset-Version`、`X-Unity-Version`、`X-Platform`、`X-DeviceModel`、`X-OperatingSystem`、`X-Install-Id`、`X-Request-Id`、`X-Session-Token`。
-- 状态码：403 → 重新拿 cookie、重新登录一次；**426 → 版本过期（§6）**；503 → 维护，退避。
+- 状态码：403 → 重新拿 cookie、重新登录一次（下载分片 403 时同样换 cookie 重试一次）；**426 → 版本过期（§6）**；503 → 维护，退避。
 - 2026-11-11 实测（jp 7.1.0，本机）：game-version 返回 `profile=production`、`domain`、`assetbundleHostHash`；`issue/api/signature` 的响应体是 `{}`，Set-Cookie 里有 `CloudFront-Policy` / `-Signature` / `-Key-Pair-Id` 三项，拼成 Cookie 后 API 才不再返回 CloudFront 的 403。
+- 2026-11-19 实测（JP2）：`CloudFront-Policy` 的 `DateLessThan` 是发放时间 + **24 小时**。过期后**登录仍然成功**（登录不校验 cookie），只有下载分片返回 403，所以不能只靠登录的 403 发现过期：cookie 用满 6 小时就在登录前主动换新，分片 403 时也换一次再试。
 - **game-version 对 JP2 的 IP 返回 CloudFront 403**（2026-11-11 实测；本机正常，issue 和游戏 API 在 JP2 上都能访问）。game-version 只用来拿 API 域名，正式服域名固定为 `production-game-api.sekai.colorfulpalette.org`，所以 game-version 返回 HTTP 错误时记告警、改用这个默认域名（`sega.Config.DefaultAPIDomain`）。JP2 节点上实测回退后登录、下载 417 张表正常。
 - **`GET /api/system` 只要 cookie、不用登录**，返回全部 appVersion（当前 100 条）及各自的 `appVersionStatus`、`assetVersion`、`multiPlayVersion`；目前只有 7.1.0 是 `available`。新版本上线时会出现在这里，可作为 jp 的新版本信号（比登录便宜），交给 builder M6 参考。
 - Haruki jp 仓库的输出与 cn 不同：版本文件字段顺序为 appHash, systemProfile, appVersion, multiPlayVersion, assetVersion, appVersionStatus, dataVersion, assetHash, removeAssetVersion, cdnVersion（恒为 0）；表内键保持服务器顺序，不排序；另有 `compactCards` / `compactGachas`，**不是服务器的数据**，是 Haruki-Sekai-API 自己生成的派生文件（`cards` / `gachas` 里的 `cardParameters` / `gachaDetails` 改成按列存放，给 Haruki-Toolbox 减小下载体积），见 O10。实现见 `master.LayoutSega`；对照结果见 §15。
@@ -200,7 +201,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 **GitHub 仓库（线上）：用 Git Data API（`internal/ghrepo`，2026-11-17 起）。**
 
 1. 每轮 `GET git/ref/heads/main`；提交变了才 `GET git/commits/{sha}` 和 `GET git/trees/{tree}?recursive=1`，得到每个文件的 blob 哈希（列表被截断时报错）。
-2. 每张表生成 JSON 后立即算 git blob 哈希（`sha1("blob <长度>\0" + 内容)`），和树里的比较；相同就丢掉。不同的内容攒成一批（≤ 8 MB、≤ 200 个文件），用一个 `POST git/trees`（条目带内联 `content`、按序号命名、不带 base_tree）让 GitHub 写出这些 blob；非 UTF-8 或单个超过 8 MB 的文件走 `POST git/blobs`（base64）。GitHub 返回的每个对象名都要和本地算出的一致，否则报错、不提交。远端树里已有的对象不重复上传。
+2. 每张表生成 JSON 后立即算 git blob 哈希（`sha1("blob <长度>\0" + 内容)`），和树里的比较；相同就丢掉。不同的内容攒成一批（≤ 8 MB、≤ 200 个文件），用一个 `POST git/trees`（条目带内联 `content`、按序号命名、不带 base_tree）让 GitHub 写出这些 blob；非 UTF-8 或单个超过 8 MB 的文件走 `POST git/blobs`（base64）。超过 **32 MB** 的文件 API 收不下（2026-11-19 jp 51MB 的 `gachas.json` 返回 422 "input was too large"），改用 git：在临时目录建一个全新的裸仓库，只放这个 blob，无父提交强制推到 `refs/heads/moesekai-sync/upload-<对象名前 12 位>`；打包不需要旧内容，不受部分克隆的影响。提交完成（或出错）后删除临时分支，每轮开始时也清理遗留的临时分支。GitHub 返回的每个对象名都要和本地算出的一致，否则报错、不提交。远端树里已有的对象不重复上传。
 3. 最后一个 `POST git/trees`（`base_tree` = 当前树，条目只写变化的路径和对象名，删除写 `sha: null`）→ `POST git/commits`（不填作者，GitHub 用 App 身份 `moesekai-bot[bot]` 并签名）→ `PATCH git/refs/heads/main`（`force: false`）。不是快进（422）时重新读分支，在新的 HEAD 上重算，最多 3 次；当初因「没变」没上传的内容一定在旧树里，GitHub 上已有，不需要重新生成。
 4. 删除保护（§7）按「这次没有、树里有」的文件计算。
 5. `versions/current_version.json` 用 `GET git/blobs/{sha}` 读，按对象名缓存。
@@ -251,7 +252,7 @@ cn 一份完整输出约 230 MB（432 个文件，其中 compact 展开表 82 MB
 | O1 | ~~jp 注册与登录的完整请求细节~~ | **已解决（N3，2026-11-11）**：按公开实现（sssekai 等）的请求格式，本机注册、登录、分片下载跑通，JP2 上线运行正常；见 §5.1、§15 |
 | O2 | ~~`compact*` 表展开规则、Haruki 多出的文件~~ | **已解决（N1）**：多出的 8 个文件就是 compact 表展开的结果，规则见 §5.3 |
 | O3 | ~~数据仓库与 App 安装范围~~ | **已定（2026-11-11）**：五个公开仓库 `StarMoe-org/moesekai-masterdata-{jp,cn,en,hmt,kr}` 已建（区服代码与 moesekai-app-meta 一致，繁中服用 `hmt`），`moesekai-bot` 已加装到这五个仓库；en / hmt / kr 暂时空着 |
-| O4 | ~~拉 master 的间隔~~ | **已定（2026-11-11）**：jp、cn 默认都是 **5 分钟**（`MOESEKAI_POLL_JP` / `MOESEKAI_POLL_CN` 可调），±10% 抖动；网络错误、5xx 指数退避（1 分钟起，最长 30 分钟）；503 维护固定 5 分钟后再试；426 / `not_available` 暂停该区服，转 §6 刷新 app-meta、请求 builder；jp 的 cookie 跨轮复用，403 时才重新获取 |
+| O4 | ~~拉 master 的间隔~~ | **已定（2026-11-11）**：jp、cn 默认都是 **5 分钟**（`MOESEKAI_POLL_JP` / `MOESEKAI_POLL_CN` 可调），±10% 抖动；网络错误、5xx 指数退避（1 分钟起，最长 30 分钟）；503 维护固定 5 分钟后再试；426 / `not_available` 暂停该区服，转 §6 刷新 app-meta、请求 builder；jp 的 cookie 跨轮复用，403 或用满 6 小时时重新获取 |
 | O5 | ~~首次导入~~ | **已定（2026-11-11）**：数据仓库从空仓库开始，第一次运行提交当前完整的 master 和版本文件，不导入 Haruki 的历史 |
 | O6 | ~~cn login 用哪个账号的 uid~~ | **已定（2026-11-11）**：用户自己的国服账号 uid（只用 id，不用 token），放在服务的 Secret `MOESEKAI_CN_UID`；值不进仓库、不写日志。被风控时影响的是这个账号，需要换号时只改这个值。官方修复免 token login 后改用固定的已登录账号（§5.2），凭据同样只放 Secret |
 | O7 | ~~`billingShopItemRandomBoxGroups`~~ | **已定（2026-11-12）：保持对象格式**（`{id, randomBoxGroupId, resourceBoxId, rate}`），与其他表一致。Haruki（sc / tc / kr）和 Sekai-World 的 sekai-client 输出无字段名的数组，只是因为它们的结构生成器拿不到这个类（类名不带 Master 前缀）的字段名，不是有意为之；值完全相同。只有 Nuverse 系的服有这张表，StarMoe 下没有项目使用 |
